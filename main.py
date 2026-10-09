@@ -190,7 +190,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.4"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -5433,8 +5433,24 @@ def _download_and_install_update(url: str, latest: str):
         _ui_call(_quit_for_update)
     except Exception as e:
         _report_problem("Update failed", exc=e, counts_as_failure=False)
+        # Fallback: let the browser download it instead (the browser often
+        # works where the program's own download is blocked by the network).
+        _ui_call(_offer_browser_download, url)
     finally:
         _update_download_in_flight = False
+
+
+def _offer_browser_download(url: str):
+    """Ask the user to open the installer link in the browser. Tk main thread only."""
+    try:
+        if messagebox.askyesno(
+                "Update",
+                "Automatic download failed.\n"
+                "Open the download link in your browser instead?\n\n"
+                "فشل التحميل التلقائي، تفتح رابط التحميل في المتصفح؟"):
+            webbrowser.open(url)
+    except Exception as e:
+        safe_print(f"[INFO] Could not open the browser fallback: {e}")
 
 
 def _quit_for_update():
