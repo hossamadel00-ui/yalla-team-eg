@@ -65,6 +65,8 @@ import traceback
 import urllib.request
 import urllib.error
 from datetime import datetime
+import math
+import colorsys
 
 try:
     import winreg  # Windows only - used for the "Start with Windows" toggle
@@ -190,7 +192,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.13"
+APP_VERSION = "1.0.14"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -1691,6 +1693,10 @@ def _restart_program():
     """
     safe_print("[INFO] Restarting the program...")
     try:
+        _work_shutdown()   # save the work timer + stop its hooks
+    except Exception:
+        pass
+    try:
         _popup_watcher_stop_event.set()
     except Exception:
         pass
@@ -1776,6 +1782,14 @@ def _on_key_event(event):
     explicitly ignores whatever key(s) make up the current trigger.
     """
     global _buffer
+
+    # "يلا نشتغل": Enter may be a sent message. Tiny, exception-safe and placed
+    # BEFORE every other check, so it never touches the translation buffer logic.
+    try:
+        if event.event_type == "down" and (event.name or "").lower() == "enter":
+            _work_note_enter()
+    except Exception:
+        pass
 
     if not _enabled:
         return  # Master switch is off: don't track anything
@@ -4162,12 +4176,14 @@ _BUTTON_STYLES = {
         "stop":    ("#c0392b", "#a93226", "#ffffff"),   # Disable (program is on)
         "start":   ("#1b8a3a", "#167030", "#ffffff"),   # Enable  (program is off)
         "neutral": ("#e2e6ea", "#d1d7dd", "#1f2023"),   # Retry last, more menu
+        "accent":  ("#d9822b", "#bf7123", "#ffffff"),   # يلا نشتغل
     },
     "dark": {
         "primary": ("#1f7fb8", "#2f92cc", "#ffffff"),
         "stop":    ("#c0463d", "#d85a50", "#ffffff"),
         "start":   ("#2e9e5b", "#3bb26b", "#ffffff"),
         "neutral": ("#3a3d43", "#4a4e55", "#e8e8e8"),
+        "accent":  ("#e08e3c", "#f0a04f", "#ffffff"),
     },
 }
 _BUTTON_ROLES = set(_BUTTON_STYLES["light"])
@@ -4836,6 +4852,10 @@ def _exit_program():
     safe_print("[INFO] Exiting...")
     _popup_watcher_stop_event.set()
     try:
+        _work_shutdown()   # save the work timer + stop its hooks
+    except Exception:
+        pass
+    try:
         keyboard.unhook_all()
     except Exception:
         pass
@@ -4999,6 +5019,9 @@ def _build_main_window(root):
     more_button = tk.Button(_actions_row, text="⋯", width=4)
     _style_button(more_button, "neutral", font=("Segoe UI", 12, "bold"))
     more_button.grid(row=0, column=3, padx=(6, 0), ipady=3)
+    _work_button = tk.Button(_actions_row, text="⏱  يلا نشتغل", command=_work_open_window)
+    _style_button(_work_button, "accent")
+    _work_button.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0), ipady=6)
     more_menu = tk.Menu(root, tearoff=0)
     more_menu.add_command(label="Minimize to tray", command=_hide_to_tray)
     more_menu.add_command(label="Check for updates", command=_check_for_update_manual)
@@ -5207,6 +5230,10 @@ def _tray_exit(icon, item):
     safe_print("[INFO] Exiting...")
     _popup_watcher_stop_event.set()
     try:
+        _work_shutdown()   # save the work timer + stop its hooks
+    except Exception:
+        pass
+    try:
         keyboard.unhook_all()
     except Exception:
         pass
@@ -5253,6 +5280,1074 @@ def _tray_is_dark(item):
     return _theme_name == "dark"
 
 
+# =========================================================================
+# "يلا نشتغل" - work countdown timer + sent-messages counter
+# -------------------------------------------------------------------------
+# A separate window (opened from the main window or the tray menu) with:
+#   * a countdown timer (default 6h) that never auto-starts,
+#   * a counter of the messages the user SENDS inside an Android emulator
+#     (Enter key, or a click on the green circular send arrow),
+#   * a history of finished sessions.
+#
+# Threads: the keyboard hook (_on_key_event) and the mouse hook only drop a
+# tiny event into _work_events. ONE worker thread does the (slower) checks
+# - foreground program, pixel colors - and updates the counter. Everything
+# the user sees is drawn by Tk on the MAIN thread (_work_tick every 250 ms,
+# plus _ui_call for the popups).
+#
+# Known limitations (by design):
+#   * Enter pressed on an EMPTY input box is still counted when a green
+#     send-button-like blob is on screen. Fix it with the "−" button.
+#   * Colors are read with ctypes (BitBlt from the screen). On a screen with
+#     Windows scaling above 100% the program is DPI-"unaware", so the
+#     coordinates it sees are scaled consistently; the tolerant color test
+#     below is built to survive that. If detection ever misbehaves, untick
+#     "تحقق من لون السهم الأخضر" (then every Enter / every click inside the
+#     emulator window counts).
+# =========================================================================
+WORK_STATE_FILE_PATH = os.path.join(CONFIG_DIR, "work_timer.json")
+WORK_SESSIONS_FILE_PATH = os.path.join(CONFIG_DIR, "work_sessions.json")
+WORK_DEFAULT_DURATION_MINUTES = 6 * 60
+WORK_DEFAULT_THRESHOLD = 100
+WORK_DEFAULT_EMULATORS = "hd-player.exe"          # BlueStacks
+WORK_DOUBLE_SEND_SECONDS = 0.33                   # two sends this close = ONE message
+WORK_SAVE_THROTTLE_SECONDS = 1.0                  # counter writes: at most once per second
+WORK_TICK_MS = 250
+
+# Color checks (tolerant on purpose - the arrow is a green gradient):
+_WORK_CLICK_RADIUS = 12      # click check looks at a (2R+1) square around the cursor...
+_WORK_CLICK_STEP = 4         # ...sampling every 4th pixel...
+_WORK_CLICK_MIN_GREEN = 8    # ...and needs this many green samples (the white arrow in the middle is ignored)
+_WORK_ENTER_STEP = 5         # Enter check: coarse grid over the lower-right part of the window
+_WORK_ENTER_MIN_GREEN = 10
+_WORK_ENTER_SCAN_X = (0.55, 1.0)   # fractions of the window width
+_WORK_ENTER_SCAN_Y = (0.65, 1.0)   # fractions of the window height
+# While the phone keyboard's white typing bar (with "OK") is open, it covers almost the
+# whole green arrow: only a ~4 px sliver peeks out above the bar. So if the coarse scan
+# finds nothing, a second, finer scan looks at the bottom-right corner of the window.
+_WORK_ENTER_BAND_X = 0.70          # band = right 30% of the window...
+_WORK_ENTER_BAND_Y = 0.86          # ...and the bottom 14%
+_WORK_ENTER_BAND_STEP_X = 2
+_WORK_ENTER_BAND_MIN_GREEN = 8
+
+_work_lock = threading.RLock()        # guards _work (the worker thread changes 'count')
+_work_file_lock = threading.Lock()    # serializes the atomic file writes
+_work_events = queue.Queue(maxsize=200)
+_work_stop_event = threading.Event()
+_work_active = False                  # hooks/worker running (the key hook checks this)
+_work_shutting_down = False
+_work_last_counted = -10.0            # monotonic time of the last counted send
+_work_dirty = False
+_work_last_save = 0.0
+_work_write_failed_logged = False
+_work_win = None
+_work_ui = {}
+_work_alert_win = None
+_work_toast_win = None
+_work_mouse_hook = None
+_work_mouse_thread_id = 0
+_work_hook_proc_ref = None            # keep the ctypes callback alive
+_work_cfg = {"minutes": WORK_DEFAULT_DURATION_MINUTES, "threshold": WORK_DEFAULT_THRESHOLD,
+             "emulators": [WORK_DEFAULT_EMULATORS], "emulators_text": WORK_DEFAULT_EMULATORS,
+             "color_check": True}
+
+
+def _work_default_state(duration_seconds: float) -> dict:
+    return {
+        "status": "stopped",        # stopped | running | paused | finished
+        "duration": float(duration_seconds),
+        "end_ts": None,             # wall-clock end time (only while running)
+        "remaining": float(duration_seconds),   # seconds left (stopped / paused)
+        "run_started": None,        # wall-clock start of the current running stretch
+        "worked_before": 0.0,       # seconds really worked in earlier stretches
+        "session_start": None,      # wall-clock time of the first "ابدأ" of this session
+        "count": 0,
+        "alert_shown": False,       # the "خلصت شغل" alert was closed by the user
+    }
+
+
+_work = _work_default_state(WORK_DEFAULT_DURATION_MINUTES * 60)
+
+
+# ---------------------------------------------------------------- settings
+def _work_cfg_reload():
+    """Read the 'يلا نشتغل' settings from config.json into _work_cfg. Never raises."""
+    try:
+        cfg = _load_config()
+        try:
+            minutes = int(cfg.get("work_duration_minutes", WORK_DEFAULT_DURATION_MINUTES))
+        except (TypeError, ValueError):
+            minutes = WORK_DEFAULT_DURATION_MINUTES
+        try:
+            threshold = int(cfg.get("work_msg_threshold", WORK_DEFAULT_THRESHOLD))
+        except (TypeError, ValueError):
+            threshold = WORK_DEFAULT_THRESHOLD
+        text = str(cfg.get("work_emulators", WORK_DEFAULT_EMULATORS) or "")
+        names = []
+        for part in re.split(r"[,;،]", text):
+            part = part.strip().lower()
+            if not part:
+                continue
+            if not part.endswith(".exe"):
+                part += ".exe"
+            if part not in names:
+                names.append(part)
+        _work_cfg.update({
+            "minutes": max(1, minutes),
+            "threshold": max(1, threshold),
+            "emulators": names,
+            "emulators_text": ", ".join(names),
+            "color_check": bool(cfg.get("work_color_check", True)),
+        })
+    except Exception as e:
+        safe_print(f"[WARNING] Could not read the work-timer settings: {e}")
+
+
+def _work_apply_duration():
+    """
+    Changing the duration while a session is under way must not corrupt the
+    running timer, so the simplest safe rule is used: the new duration is
+    applied on the next reset. Only a timer that is still untouched
+    (stopped, never started) changes right away.
+    """
+    with _work_lock:
+        if _work["status"] == "stopped" and _work["session_start"] is None:
+            seconds = _work_cfg["minutes"] * 60
+            _work["duration"] = float(seconds)
+            _work["remaining"] = float(seconds)
+    _work_save(force=True)
+
+
+# --------------------------------------------------------------- file I/O
+def _work_write_json(path: str, data) -> bool:
+    """Atomic write (temp file + replace). Never raises."""
+    global _work_write_failed_logged
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with _work_file_lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+            os.replace(tmp, path)
+        return True
+    except Exception as e:
+        safe_print(f"[ERROR] Could not save {os.path.basename(path)}: {e}")
+        if not _work_write_failed_logged:   # tell the user once, not every second
+            _work_write_failed_logged = True
+            try:
+                _log_event("ERROR", "Work timer: could not save",
+                           f"{os.path.basename(path)}: {e}", "Check that the folder is writable.")
+            except Exception:
+                pass
+        return False
+
+
+def _work_read_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _work_save(force: bool = False):
+    """
+    Save the timer state. Timer buttons call it with force=True; the counter
+    only calls it plain, which writes at most once per second (a dirty flag
+    makes the 250 ms tick write the rest) so rapid sending never blocks.
+    """
+    global _work_dirty, _work_last_save
+    now = time.monotonic()
+    if not force and now - _work_last_save < WORK_SAVE_THROTTLE_SECONDS:
+        _work_dirty = True
+        return
+    with _work_lock:
+        snapshot = dict(_work)
+    _work_dirty = False
+    _work_last_save = now
+    _work_write_json(WORK_STATE_FILE_PATH, snapshot)
+
+
+def _work_load_history() -> list:
+    data = _work_read_json(WORK_SESSIONS_FILE_PATH, [])
+    return data if isinstance(data, list) else []
+
+
+def _work_append_history(entry: dict):
+    """Add one finished session. ALL sessions are kept (no pruning)."""
+    history = _work_load_history()
+    history.append(entry)
+    _work_write_json(WORK_SESSIONS_FILE_PATH, history)
+
+
+# ------------------------------------------------------------- timer logic
+def _work_remaining(now: float = None) -> float:
+    now = time.time() if now is None else now
+    with _work_lock:
+        status = _work["status"]
+        if status == "running" and _work["end_ts"] is not None:
+            return max(0.0, _work["end_ts"] - now)
+        if status == "finished":
+            return 0.0
+        return max(0.0, float(_work["remaining"]))
+
+
+def _work_worked(now: float = None) -> float:
+    """Seconds the timer was REALLY running (paused time is not included)."""
+    now = time.time() if now is None else now
+    with _work_lock:
+        worked = float(_work["worked_before"])
+        if _work["status"] == "running" and _work["run_started"] is not None:
+            end = min(now, _work["end_ts"]) if _work["end_ts"] is not None else now
+            worked += max(0.0, end - _work["run_started"])
+        return worked
+
+
+def _work_start():
+    """'ابدأ' / 'استكمال': start counting down from the remaining time."""
+    now = time.time()
+    with _work_lock:
+        if _work["status"] not in ("stopped", "paused") or _work["remaining"] <= 0:
+            return
+        _work["end_ts"] = now + _work["remaining"]
+        _work["run_started"] = now
+        if _work["session_start"] is None:
+            _work["session_start"] = now
+        _work["alert_shown"] = False
+        _work["status"] = "running"
+    _work_save(force=True)
+
+
+def _work_pause():
+    """'إيقاف مؤقت': keep the remaining time, stop the clock."""
+    now = time.time()
+    with _work_lock:
+        if _work["status"] != "running":
+            return
+        _work["worked_before"] = _work_worked(now)
+        _work["remaining"] = max(0.0, (_work["end_ts"] or now) - now)
+        _work["end_ts"] = None
+        _work["run_started"] = None
+        _work["status"] = "paused"
+    _work_save(force=True)
+
+
+def _work_check_finish(now: float = None) -> bool:
+    """Called by the tick: turn 'running' into 'finished' when the end time has passed."""
+    now = time.time() if now is None else now
+    with _work_lock:
+        if _work["status"] != "running" or _work["end_ts"] is None or now < _work["end_ts"]:
+            return False
+        started = _work["run_started"] if _work["run_started"] is not None else _work["end_ts"]
+        _work["worked_before"] = float(_work["worked_before"]) + max(0.0, _work["end_ts"] - started)
+        _work["remaining"] = 0.0
+        _work["end_ts"] = None
+        _work["run_started"] = None
+        _work["status"] = "finished"      # stays at 00:00:00 until "ريسيت" (no auto-restart)
+        _work["alert_shown"] = False
+    _work_save(force=True)
+    _log_event("INFO", "Work timer finished", "خلصت شغل يا عم ابسط", "")
+    return True
+
+
+def _work_do_reset():
+    """The reset itself (after the user confirmed): log the session, then start clean."""
+    now = time.time()
+    entry = None
+    with _work_lock:
+        worked = _work_worked(now)
+        if _work["session_start"] is not None or _work["count"] > 0:
+            stamp = _work["session_start"] if _work["session_start"] is not None else now
+            moment = datetime.fromtimestamp(stamp)
+            entry = {
+                "date": moment.strftime("%Y-%m-%d"),
+                "start": moment.strftime("%H:%M:%S"),
+                "worked_seconds": int(round(worked)),
+                "count": int(_work["count"]),
+            }
+        _work.clear()
+        _work.update(_work_default_state(_work_cfg["minutes"] * 60))   # new duration applies here
+    if entry is not None:
+        _work_append_history(entry)
+    _work_close_alert()
+    _work_save(force=True)
+    _work_refresh_history()
+    _work_refresh_window()
+
+
+def _work_confirm_reset():
+    """'ريسيت' button: ask first (themed box), then reset."""
+    try:
+        if messagebox.askyesno(
+                "ريسيت",
+                "متأكد إنك عايز تعمل ريسيت؟\nالجلسة دي هتتسجل في السجل والعداد هيرجع صفر.",
+                parent=_work_win):
+            _work_do_reset()
+    except Exception as e:
+        _report_problem("Work timer reset", exc=e, counts_as_failure=False)
+
+
+def _work_adjust_count(delta: int):
+    """The + / − buttons: never below 0, never triggers the notification."""
+    with _work_lock:
+        _work["count"] = max(0, int(_work["count"]) + delta)
+    _work_save(force=True)
+    _work_refresh_window()
+
+
+def _work_load_state():
+    """Read work_timer.json at startup. Time kept running while the program was closed."""
+    _work_cfg_reload()
+    data = _work_read_json(WORK_STATE_FILE_PATH, {})
+    if not isinstance(data, dict):
+        data = {}
+    state = _work_default_state(_work_cfg["minutes"] * 60)
+
+    def num(key, default, minimum=None):
+        try:
+            value = float(data.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, value) if minimum is not None else value
+
+    def opt_num(key):
+        try:
+            return float(data[key]) if data.get(key) is not None else None
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    if data.get("status") in ("stopped", "running", "paused", "finished"):
+        state["status"] = data["status"]
+        state["duration"] = num("duration", state["duration"], 1.0)
+        state["remaining"] = num("remaining", state["duration"], 0.0)
+        state["end_ts"] = opt_num("end_ts")
+        state["run_started"] = opt_num("run_started")
+        state["worked_before"] = num("worked_before", 0.0, 0.0)
+        state["session_start"] = opt_num("session_start")
+        state["alert_shown"] = bool(data.get("alert_shown", False))
+        try:
+            state["count"] = max(0, int(data.get("count", 0)))
+        except (TypeError, ValueError):
+            state["count"] = 0
+        if state["status"] == "running" and state["end_ts"] is None:
+            state["status"] = "paused"        # damaged file: keep the remaining time, do not guess
+        if state["status"] == "running" and state["run_started"] is None:
+            state["run_started"] = time.time()
+        if state["status"] == "finished":
+            state["remaining"] = 0.0
+    with _work_lock:
+        _work.clear()
+        _work.update(state)
+    _work_check_finish()      # finished while the program was closed -> the tick shows the alert
+
+
+# ----------------------------------------------------------- send counting
+def _work_register_send(stamp: float) -> bool:
+    """One detected send. Worker thread. Two sends within ~0.33 s are ONE message."""
+    global _work_last_counted
+    with _work_lock:
+        if stamp - _work_last_counted < WORK_DOUBLE_SEND_SECONDS:
+            return False
+        _work_last_counted = stamp
+        _work["count"] = int(_work["count"]) + 1
+        count = _work["count"]
+    _work_save()   # throttled
+    threshold = _work_cfg["threshold"]
+    if threshold > 0 and count % threshold == 0:
+        _ui_call(_work_show_toast, f"خلصت {count} رسالة")
+    return True
+
+
+def _work_note_enter():
+    """Called by the keyboard hook on Enter key-down. Must stay tiny: just queue it."""
+    if not _work_active:
+        return
+    try:
+        _work_events.put_nowait(("enter", time.monotonic()))
+    except queue.Full:
+        pass
+
+
+def _work_is_green(r: int, g: int, b: int) -> bool:
+    """Bright green, tolerant of the arrow's gradient (hue-based)."""
+    if g < 110 or g < r + 30 or g < b + 30:
+        return False
+    hue, sat, val = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+    return 0.22 <= hue <= 0.46 and sat >= 0.45 and val >= 0.45     # ~80°..165°
+
+
+if _IS_WINDOWS:
+    class _WorkBitmapInfoHeader(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                    ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
+
+    class _WorkBitmapInfo(ctypes.Structure):
+        _fields_ = [("bmiHeader", _WorkBitmapInfoHeader), ("bmiColors", wintypes.DWORD * 3)]
+
+    _WorkHookProc = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+    # Private DLL handles, so these prototypes never touch the ones the rest of the file uses.
+    _w_user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _w_gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    _w_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        _w_user32.GetDC.argtypes = [wintypes.HWND]
+        _w_user32.GetDC.restype = wintypes.HDC
+        _w_user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        _w_user32.ReleaseDC.restype = ctypes.c_int
+        _w_user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        _w_user32.GetWindowRect.restype = wintypes.BOOL
+        _w_user32.GetForegroundWindow.argtypes = []
+        _w_user32.GetForegroundWindow.restype = wintypes.HWND
+        _w_user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        _w_user32.GetCursorPos.restype = wintypes.BOOL
+        _w_user32.SetWindowsHookExW.argtypes = [ctypes.c_int, _WorkHookProc, wintypes.HINSTANCE, wintypes.DWORD]
+        _w_user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        _w_user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        _w_user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        _w_user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        _w_user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+        _w_user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        _w_user32.GetMessageW.restype = ctypes.c_int
+        _w_user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        _w_user32.PostThreadMessageW.restype = wintypes.BOOL
+        _w_gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        _w_gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        _w_gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+        _w_gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+        _w_gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+        _w_gdi32.SelectObject.restype = wintypes.HGDIOBJ
+        _w_gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+        _w_gdi32.BitBlt.restype = wintypes.BOOL
+        _w_gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT,
+                                       ctypes.c_void_p, ctypes.POINTER(_WorkBitmapInfo), wintypes.UINT]
+        _w_gdi32.GetDIBits.restype = ctypes.c_int
+        _w_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        _w_gdi32.DeleteObject.restype = wintypes.BOOL
+        _w_gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        _w_gdi32.DeleteDC.restype = wintypes.BOOL
+        _w_kernel32.GetCurrentThreadId.argtypes = []
+        _w_kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        _w_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        _w_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    except Exception as _e:
+        safe_print(f"[WARNING] Work counter: could not prepare the Windows calls: {_e}")
+
+
+def _work_grab(x: int, y: int, w: int, h: int):
+    """Copy a screen rectangle with ONE BitBlt. Returns BGRA bytes (top-down) or None."""
+    if not _IS_WINDOWS or w <= 0 or h <= 0 or w > 3000 or h > 3000:
+        return None
+    screen_dc = _w_user32.GetDC(None)
+    if not screen_dc:
+        return None
+    mem_dc = bitmap = old = None
+    try:
+        mem_dc = _w_gdi32.CreateCompatibleDC(screen_dc)
+        bitmap = _w_gdi32.CreateCompatibleBitmap(screen_dc, w, h)
+        if not mem_dc or not bitmap:
+            return None
+        old = _w_gdi32.SelectObject(mem_dc, bitmap)
+        # SRCCOPY | CAPTUREBLT (also captures layered windows)
+        if not _w_gdi32.BitBlt(mem_dc, 0, 0, w, h, screen_dc, x, y, 0x00CC0020 | 0x40000000):
+            return None
+        _w_gdi32.SelectObject(mem_dc, old)    # GetDIBits needs the bitmap OUT of any DC
+        old = None
+        info = _WorkBitmapInfo()
+        info.bmiHeader.biSize = ctypes.sizeof(_WorkBitmapInfoHeader)
+        info.bmiHeader.biWidth = w
+        info.bmiHeader.biHeight = -h          # negative = top-down rows
+        info.bmiHeader.biPlanes = 1
+        info.bmiHeader.biBitCount = 32
+        info.bmiHeader.biCompression = 0      # BI_RGB
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not _w_gdi32.GetDIBits(mem_dc, bitmap, 0, h, buf, ctypes.byref(info), 0):
+            return None
+        return buf.raw
+    finally:
+        try:
+            if old:
+                _w_gdi32.SelectObject(mem_dc, old)
+            if bitmap:
+                _w_gdi32.DeleteObject(bitmap)
+            if mem_dc:
+                _w_gdi32.DeleteDC(mem_dc)
+            _w_user32.ReleaseDC(None, screen_dc)
+        except Exception:
+            pass
+
+
+def _work_count_green(data: bytes, w: int, h: int, step: int, stop_at: int,
+                      x_from: int = 0, y_from: int = 0, step_y: int = None) -> int:
+    """Count green samples on a grid (stops early once 'stop_at' is reached)."""
+    found = 0
+    for row in range(y_from, h, step_y or step):
+        base = row * w * 4
+        for col in range(x_from, w, step):
+            i = base + col * 4
+            b, g, r = data[i], data[i + 1], data[i + 2]
+            if g > r and g > b and _work_is_green(r, g, b):
+                found += 1
+                if found >= stop_at:
+                    return found
+    return found
+
+
+def _work_click_is_send_button(x: int, y: int) -> bool:
+    """Is the click on the green send arrow? (green all around the cursor - the arrow itself is white)"""
+    side = 2 * _WORK_CLICK_RADIUS + 1
+    data = _work_grab(x - _WORK_CLICK_RADIUS, y - _WORK_CLICK_RADIUS, side, side)
+    if not data:
+        return False
+    return _work_count_green(data, side, side, _WORK_CLICK_STEP, _WORK_CLICK_MIN_GREEN) >= _WORK_CLICK_MIN_GREEN
+
+
+def _work_green_blob_in_window(rect) -> bool:
+    """Is a green send-button-like blob visible in the lower-right of the emulator window?"""
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width < 120 or height < 120:
+        return False
+    x0 = rect.left + int(width * _WORK_ENTER_SCAN_X[0])
+    x1 = rect.left + int(width * _WORK_ENTER_SCAN_X[1])
+    y0 = rect.top + int(height * _WORK_ENTER_SCAN_Y[0])
+    y1 = rect.top + int(height * _WORK_ENTER_SCAN_Y[1])
+    w, h = min(x1 - x0, 1600), min(y1 - y0, 1200)
+    data = _work_grab(x0, y0, w, h)
+    if not data:
+        return False
+    if _work_count_green(data, w, h, _WORK_ENTER_STEP, _WORK_ENTER_MIN_GREEN) >= _WORK_ENTER_MIN_GREEN:
+        return True      # the whole green arrow is visible
+    # Typing bar open: only the top edge of the arrow shows. Fine scan of the bottom-right band
+    # (the same screen grab, so no extra capture).
+    band_x = max(0, int(width * _WORK_ENTER_BAND_X) - (x0 - rect.left))
+    band_y = max(0, int(height * _WORK_ENTER_BAND_Y) - (y0 - rect.top))
+    return _work_count_green(data, w, h, _WORK_ENTER_BAND_STEP_X, _WORK_ENTER_BAND_MIN_GREEN,
+                             x_from=band_x, y_from=band_y, step_y=1) >= _WORK_ENTER_BAND_MIN_GREEN
+
+
+def _work_foreground_emulator_rect():
+    """The foreground window's rectangle if it belongs to a configured emulator, else None."""
+    name = _get_foreground_process_name()
+    if not name or name not in _work_cfg["emulators"]:
+        return None
+    hwnd = _w_user32.GetForegroundWindow()
+    rect = wintypes.RECT()
+    if not hwnd or not _w_user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return rect
+
+
+def _work_handle_event(event):
+    """Worker thread: decide whether one Enter / one click is a sent message."""
+    kind, stamp = event[0], event[-1]
+    if time.monotonic() - stamp > 2.0:
+        return                                  # stale (the worker was starved): ignore
+    rect = _work_foreground_emulator_rect()
+    if rect is None:
+        return                                  # emulator is not in front: no counting
+    check_color = _work_cfg["color_check"]
+    if kind == "enter":
+        if check_color and not _work_green_blob_in_window(rect):
+            return
+    elif kind == "click":
+        x, y = event[1], event[2]
+        if check_color:
+            if not _work_click_is_send_button(x, y):
+                return
+        elif not (rect.left <= x <= rect.right and rect.top <= y <= rect.bottom):
+            return                              # fallback mode: any click INSIDE the emulator window
+    else:
+        return
+    _work_register_send(stamp)
+
+
+def _work_worker_loop():
+    while not _work_stop_event.is_set():
+        try:
+            event = _work_events.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            _work_handle_event(event)
+        except Exception as e:
+            safe_print(f"[WARNING] Work counter: could not check an event: {e}")
+
+
+def _work_mouse_callback(n_code, w_param, l_param):
+    """WH_MOUSE_LL callback. Must return fast: read the cursor, queue it, done."""
+    try:
+        if n_code >= 0 and w_param == 0x0201 and _work_active:     # WM_LBUTTONDOWN
+            pt = wintypes.POINT()
+            if _w_user32.GetCursorPos(ctypes.byref(pt)):
+                _work_events.put_nowait(("click", pt.x, pt.y, time.monotonic()))
+    except Exception:
+        pass
+    return _w_user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+
+def _work_mouse_thread():
+    """Own thread + message loop for the low-level mouse hook (daemon)."""
+    global _work_mouse_hook, _work_mouse_thread_id, _work_hook_proc_ref
+    try:
+        _work_mouse_thread_id = _w_kernel32.GetCurrentThreadId()
+        _work_hook_proc_ref = _WorkHookProc(_work_mouse_callback)
+        module = _w_kernel32.GetModuleHandleW(None)
+        _work_mouse_hook = _w_user32.SetWindowsHookExW(14, _work_hook_proc_ref, module, 0)   # WH_MOUSE_LL
+        if not _work_mouse_hook:
+            raise OSError(f"SetWindowsHookEx failed (error {ctypes.get_last_error()})")
+        msg = wintypes.MSG()
+        while _w_user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            pass
+    except Exception as e:
+        safe_print(f"[ERROR] Work counter: mouse hook failed: {e}")
+        _ui_call(_log_event, "WARN", "Work counter: mouse clicks unavailable", str(e),
+                 "Enter will still be counted; use the + button for clicks.")
+    finally:
+        try:
+            if _work_mouse_hook:
+                _w_user32.UnhookWindowsHookEx(_work_mouse_hook)
+        except Exception:
+            pass
+        _work_mouse_hook = None
+
+
+def _work_start_background():
+    """Start the worker thread and the mouse hook (both daemon threads)."""
+    global _work_active
+    if not _IS_WINDOWS or _work_active:
+        return
+    _work_stop_event.clear()
+    _work_active = True
+    threading.Thread(target=_work_worker_loop, daemon=True, name="work-worker").start()
+    threading.Thread(target=_work_mouse_thread, daemon=True, name="work-mouse-hook").start()
+
+
+def _work_shutdown():
+    """Save the state and stop the hooks/threads. Safe to call more than once."""
+    global _work_active, _work_shutting_down
+    if _work_shutting_down:
+        return
+    _work_shutting_down = True
+    try:
+        _work_save(force=True)
+    except Exception:
+        pass
+    _work_active = False
+    _work_stop_event.set()
+    try:
+        if _IS_WINDOWS:
+            if _work_mouse_hook:
+                _w_user32.UnhookWindowsHookEx(_work_mouse_hook)
+            if _work_mouse_thread_id:
+                _w_user32.PostThreadMessageW(_work_mouse_thread_id, 0x0012, 0, 0)   # WM_QUIT
+    except Exception:
+        pass
+
+
+# --------------------------------------------------- popups (Tk main thread)
+def _work_no_activate(win):
+    """Make a window that never steals keyboard focus (the user is typing in the emulator)."""
+    if not _IS_WINDOWS:
+        return
+    try:
+        win.update_idletasks()
+        hwnd = win.winfo_id()
+        for handle in {hwnd, ctypes.windll.user32.GetParent(hwnd)}:
+            if handle:
+                style = ctypes.windll.user32.GetWindowLongW(handle, -20)         # GWL_EXSTYLE
+                ctypes.windll.user32.SetWindowLongW(handle, -20, style | 0x08000000 | 0x00000080)  # NOACTIVATE | TOOLWINDOW
+    except Exception:
+        pass
+
+
+def _work_play_alert_sound():
+    try:
+        import winsound
+        for freq in (880, 1100, 880, 1100):
+            winsound.Beep(freq, 220)
+    except Exception:
+        pass
+
+
+def _work_close_alert():
+    global _work_alert_win
+    try:
+        if _work_alert_win is not None and _work_alert_win.winfo_exists():
+            _work_alert_win.destroy()
+    except tk.TclError:
+        pass
+    _work_alert_win = None
+
+
+def _work_dismiss_alert():
+    """The user closed the 'خلصت شغل' alert: it will not come back at the next start."""
+    with _work_lock:
+        _work["alert_shown"] = True
+    _work_save(force=True)
+    _work_close_alert()
+
+
+def _work_show_alert():
+    """Topmost 'خلصت شغل يا عم ابسط' window. It stays until the user closes it."""
+    global _work_alert_win
+    try:
+        if _work_alert_win is not None and _work_alert_win.winfo_exists():
+            return
+    except tk.TclError:
+        pass
+    try:
+        win = tk.Toplevel(_root)
+        _work_alert_win = win
+        _theme_skip.add(str(win))
+        win.title("يلا نشتغل")
+        win.configure(bg="#b3261e")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        tk.Label(win, text="خلصت شغل يا عم ابسط", font=("Segoe UI", 26, "bold"),
+                 fg="white", bg="#b3261e", padx=50, pady=34).pack()
+        button = tk.Button(win, text="تمام", font=("Segoe UI", 12, "bold"), relief="flat", bd=0,
+                           bg="white", fg="#b3261e", activebackground="#f2f2f2", cursor="hand2",
+                           padx=30, pady=6, command=_work_dismiss_alert)
+        button.pack(pady=(0, 26))
+        win.protocol("WM_DELETE_WINDOW", _work_dismiss_alert)
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        win.geometry(f"+{(win.winfo_screenwidth() - w) // 2}+{(win.winfo_screenheight() - h) // 3}")
+        _work_no_activate(win)     # shows on top but never grabs the keyboard focus
+        threading.Thread(target=_work_play_alert_sound, daemon=True).start()
+    except Exception as e:
+        _report_problem("Work timer alert", exc=e, counts_as_failure=False)
+
+
+def _work_show_toast(text: str):
+    """Small topmost message that disappears by itself (the 'خلصت N رسالة' notice)."""
+    global _work_toast_win
+    try:
+        if _work_toast_win is not None and _work_toast_win.winfo_exists():
+            _work_toast_win.destroy()
+    except tk.TclError:
+        pass
+    try:
+        win = tk.Toplevel(_root)
+        _work_toast_win = win
+        _theme_skip.add(str(win))
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#1b8a3a")
+        tk.Label(win, text=text, font=("Segoe UI", 16, "bold"), fg="white", bg="#1b8a3a",
+                 padx=28, pady=14).pack()
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        win.geometry(f"+{win.winfo_screenwidth() - w - 24}+{win.winfo_screenheight() - h - 80}")
+        _work_no_activate(win)
+        win.after(4000, lambda: win.destroy() if win.winfo_exists() else None)
+        threading.Thread(target=_play_soft_sound, daemon=True).start()
+    except Exception as e:
+        safe_print(f"[WARNING] Work counter popup failed: {e}")
+
+
+# ------------------------------------------------------------------ window
+def _work_format_hms(seconds: float) -> str:
+    total = int(math.ceil(max(0.0, seconds) - 1e-6))
+    return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def _work_format_worked(seconds: float) -> str:
+    total = int(seconds) // 60
+    return f"{total // 60}س {total % 60}د"
+
+
+def _work_refresh_history():
+    listbox = _work_ui.get("history")
+    try:
+        if listbox is None or not listbox.winfo_exists():
+            return
+        listbox.delete(0, "end")
+        for entry in reversed(_work_load_history()):        # newest first
+            listbox.insert("end", f"{entry.get('date', '?')} | "
+                                  f"{_work_format_worked(entry.get('worked_seconds', 0))} | "
+                                  f"{entry.get('count', 0)} رسالة")
+    except tk.TclError:
+        pass
+
+
+def _work_refresh_window():
+    """Update the labels/buttons from the state. Cheap; called by the tick."""
+    win = _work_win
+    try:
+        if win is None or not win.winfo_exists():
+            return
+    except tk.TclError:
+        return
+    now = time.time()
+    with _work_lock:
+        status, count = _work["status"], int(_work["count"])
+    ui = _work_ui
+    try:
+        timer_text = _work_format_hms(_work_remaining(now))
+        if ui["timer"].cget("text") != timer_text:
+            ui["timer"].config(text=timer_text)
+        status_text = {"stopped": "متوقف", "running": "شغال", "paused": "إيقاف مؤقت",
+                       "finished": "خلصت شغل يا عم ابسط"}[status]
+        if ui["status"].cget("text") != status_text:
+            ui["status"].config(text=status_text)
+        main_text, main_role = {"stopped": ("ابدأ", "start"), "paused": ("استكمال", "start"),
+                                "running": ("إيقاف مؤقت", "accent"), "finished": ("ابدأ", "start")}[status]
+        main_button = ui["main_button"]
+        if main_button.cget("text") != main_text:
+            main_button.config(text=main_text)
+        if getattr(main_button, "_theme_role", None) != main_role:
+            main_button._theme_role = main_role
+            _paint_button(main_button)
+        main_button.config(state="disabled" if status == "finished" else "normal")
+        if ui["count"].cget("text") != str(count):
+            ui["count"].config(text=str(count))
+    except (tk.TclError, KeyError):
+        pass
+
+
+def _work_on_main_button():
+    with _work_lock:
+        status = _work["status"]
+    if status == "running":
+        _work_pause()
+    else:
+        _work_start()
+    _work_refresh_window()
+
+
+def _work_save_settings_from_window():
+    """Read the settings fields, save them in config.json and apply them."""
+    ui = _work_ui
+    note = ui.get("note")
+
+    def say(text, good=True):
+        try:
+            note.config(text=text, fg="#1b8a3a" if good else "#b3261e")
+            note.after(3500, lambda: note.config(text="") if note.winfo_exists() else None)
+        except Exception:
+            pass
+
+    try:
+        hours = int(ui["hours"].get().strip() or 0)
+        minutes = int(ui["minutes"].get().strip() or 0)
+        threshold = int(ui["threshold"].get().strip())
+    except ValueError:
+        say("اكتب أرقام صحيحة", False)
+        return
+    total_minutes = hours * 60 + minutes
+    if total_minutes < 1 or hours < 0 or minutes < 0 or threshold < 1:
+        say("المدة لازم تكون دقيقة على الأقل والعدد 1 على الأقل", False)
+        return
+    _save_config(work_duration_minutes=total_minutes, work_msg_threshold=threshold,
+                 work_emulators=ui["emulators"].get(), work_color_check=bool(ui["color_check"].get()))
+    _work_cfg_reload()
+    ui["emulators"].set(_work_cfg["emulators_text"])
+    _work_apply_duration()
+    _work_refresh_window()
+    say("اتحفظت ✓")
+
+
+def _work_pick_current_window():
+    """'اختار نافذة المحاكي': after 5 s read the program in front and add it to the list."""
+    ui = _work_ui
+    note = ui.get("note")
+    win = _work_win
+
+    def step(left):
+        try:
+            if win is None or not win.winfo_exists():
+                return
+            if left > 0:
+                note.config(text=f"افتح نافذة المحاكي دلوقتي... {left}", fg="#b06a00")
+                win.after(1000, lambda: step(left - 1))
+                return
+            name = _get_foreground_process_name()
+            own = os.path.basename(sys.executable).lower()
+            if not name or name == own:
+                note.config(text="ماقدرتش أحدد النافذة - افتح المحاكي وجرب تاني", fg="#b3261e")
+                return
+            current = [p.strip() for p in re.split(r"[,;،]", ui["emulators"].get()) if p.strip()]
+            if name not in [p.lower() for p in current]:
+                current.append(name)
+            ui["emulators"].set(", ".join(current))
+            _work_save_settings_from_window()
+            note.config(text=f"اتضاف: {name}", fg="#1b8a3a")
+        except tk.TclError:
+            pass
+        except Exception as e:
+            _report_problem("Work timer: pick window", exc=e, counts_as_failure=False)
+
+    step(5)
+
+
+def _work_close_window():
+    global _work_win
+    _work_save(force=True)
+    try:
+        if _work_win is not None:
+            _work_win.destroy()
+    except tk.TclError:
+        pass
+    _work_win = None
+    _work_ui.clear()
+
+
+def _work_open_window():
+    """Build and show the 'يلا نشتغل' window. Tk main thread only. A second call focuses the same window."""
+    global _work_win
+    try:
+        if _work_win is not None and _work_win.winfo_exists():
+            _work_win.deiconify()
+            _work_win.lift()
+            _work_win.focus_force()
+            return
+    except tk.TclError:
+        pass
+    try:
+        win = tk.Toplevel(_root)
+        _work_win = win
+        _work_ui.clear()
+        win.title("يلا نشتغل")
+        win.resizable(False, True)
+        x = (win.winfo_screenwidth() - 440) // 2
+        y = max(20, (win.winfo_screenheight() - 700) // 2)
+        win.geometry(f"440x700+{x}+{y}")
+        win.minsize(440, 560)
+
+        # ---- timer ----
+        _work_ui["timer"] = tk.Label(win, text="00:00:00", font=("Consolas", 46, "bold"))
+        _work_ui["timer"].pack(pady=(18, 0))
+        _work_ui["status"] = tk.Label(win, text="", font=("Segoe UI", 12, "bold"), fg="gray")
+        _work_ui["status"].pack(pady=(0, 10))
+
+        buttons = tk.Frame(win)
+        buttons.pack(fill="x", padx=18)
+        buttons.columnconfigure(0, weight=1, uniform="w")
+        buttons.columnconfigure(1, weight=1, uniform="w")
+        main_button = tk.Button(buttons, text="ابدأ", command=_work_on_main_button)
+        _style_button(main_button, "start", font=("Segoe UI", 12, "bold"))
+        main_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), ipady=7)
+        reset_button = tk.Button(buttons, text="ريسيت", command=_work_confirm_reset)
+        _style_button(reset_button, "stop", font=("Segoe UI", 12, "bold"))
+        reset_button.grid(row=0, column=1, sticky="ew", padx=(6, 0), ipady=7)
+        _work_ui["main_button"] = main_button
+
+        # ---- message counter ----
+        tk.Frame(win, height=1).pack(fill="x", padx=18, pady=(16, 8))
+        tk.Label(win, text="الرسائل اللي اتبعتت", font=("Segoe UI", 11, "bold")).pack()
+        counter_row = tk.Frame(win)
+        counter_row.pack(pady=4)
+        minus = tk.Button(counter_row, text="−", width=3, command=lambda: _work_adjust_count(-1))
+        _style_button(minus, "neutral", font=("Segoe UI", 16, "bold"))
+        minus.pack(side="left", padx=12)
+        _work_ui["count"] = tk.Label(counter_row, text="0", font=("Segoe UI", 34, "bold"), width=6)
+        _work_ui["count"].pack(side="left")
+        plus = tk.Button(counter_row, text="+", width=3, command=lambda: _work_adjust_count(1))
+        _style_button(plus, "neutral", font=("Segoe UI", 16, "bold"))
+        plus.pack(side="left", padx=12)
+
+        # ---- settings ----
+        tk.Frame(win, height=1).pack(fill="x", padx=18, pady=(10, 8))
+        settings = tk.Frame(win)
+        settings.pack(fill="x", padx=18)
+        row1 = tk.Frame(settings)
+        row1.pack(fill="x", pady=2)
+        tk.Label(row1, text="مدة الشغل:", font=("Segoe UI", 10)).pack(side="right")
+        _work_ui["minutes"] = tk.StringVar(value=str(_work_cfg["minutes"] % 60))
+        _work_ui["hours"] = tk.StringVar(value=str(_work_cfg["minutes"] // 60))
+        tk.Spinbox(row1, from_=0, to=99, width=4, textvariable=_work_ui["hours"]).pack(side="right", padx=(6, 2))
+        tk.Label(row1, text="ساعة", font=("Segoe UI", 10)).pack(side="right")
+        tk.Spinbox(row1, from_=0, to=59, width=4, textvariable=_work_ui["minutes"]).pack(side="right", padx=(10, 2))
+        tk.Label(row1, text="دقيقة", font=("Segoe UI", 10)).pack(side="right")
+        row2 = tk.Frame(settings)
+        row2.pack(fill="x", pady=2)
+        tk.Label(row2, text="نبّهني كل:", font=("Segoe UI", 10)).pack(side="right")
+        _work_ui["threshold"] = tk.StringVar(value=str(_work_cfg["threshold"]))
+        tk.Spinbox(row2, from_=1, to=100000, width=6, textvariable=_work_ui["threshold"]).pack(side="right", padx=(6, 2))
+        tk.Label(row2, text="رسالة", font=("Segoe UI", 10)).pack(side="right")
+        tk.Label(settings, text="برامج المحاكي (مفصولة بفاصلة):", font=("Segoe UI", 10),
+                 anchor="e").pack(fill="x", pady=(6, 0))
+        _work_ui["emulators"] = tk.StringVar(value=_work_cfg["emulators_text"])
+        tk.Entry(settings, textvariable=_work_ui["emulators"], font=("Segoe UI", 10)).pack(fill="x", pady=2)
+        pick = tk.Button(settings, text="اختار نافذة المحاكي الحالية", command=_work_pick_current_window)
+        _style_button(pick, "neutral", font=("Segoe UI", 9, "bold"))
+        pick.pack(fill="x", pady=2, ipady=3)
+        _work_ui["color_check"] = tk.BooleanVar(value=_work_cfg["color_check"])
+        tk.Checkbutton(settings, text="تحقق من لون السهم الأخضر", variable=_work_ui["color_check"],
+                       font=("Segoe UI", 10), anchor="e").pack(fill="x")
+        save = tk.Button(settings, text="حفظ الإعدادات", command=_work_save_settings_from_window)
+        _style_button(save, "primary", font=("Segoe UI", 10, "bold"))
+        save.pack(fill="x", pady=(4, 2), ipady=4)
+        _work_ui["note"] = tk.Label(settings, text="", font=("Segoe UI", 9), anchor="e")
+        _work_ui["note"].pack(fill="x")
+
+        # ---- history ----
+        tk.Frame(win, height=1).pack(fill="x", padx=18, pady=(6, 6))
+        tk.Label(win, text="سجل الجلسات", font=("Segoe UI", 11, "bold")).pack()
+        history_frame = tk.Frame(win)
+        history_frame.pack(fill="both", expand=True, padx=18, pady=(2, 14))
+        scrollbar = tk.Scrollbar(history_frame)
+        scrollbar.pack(side="right", fill="y")
+        listbox = tk.Listbox(history_frame, height=6, font=("Segoe UI", 10), activestyle="none",
+                             yscrollcommand=scrollbar.set, exportselection=False)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=listbox.yview)
+        _work_ui["history"] = listbox
+
+        win.protocol("WM_DELETE_WINDOW", _work_close_window)
+        _theme_apply_to(win)
+        _set_dark_titlebar(win, _theme_name == "dark")
+        _work_refresh_history()
+        _work_refresh_window()
+        win.lift()
+        win.focus_force()
+    except Exception as e:
+        _report_problem("Work timer window", exc=e, counts_as_failure=False)
+
+
+# -------------------------------------------------------------------- tick
+def _work_tick():
+    """Every 250 ms on the Tk main thread: finish detection, alert, delayed save, window refresh."""
+    try:
+        _work_check_finish()
+        with _work_lock:
+            need_alert = _work["status"] == "finished" and not _work["alert_shown"]
+        if need_alert:
+            _work_show_alert()
+        if _work_dirty and time.monotonic() - _work_last_save >= WORK_SAVE_THROTTLE_SECONDS:
+            _work_save(force=True)
+        _work_refresh_window()
+    except Exception as e:
+        safe_print(f"[WARNING] Work timer tick failed: {e}")
+    finally:
+        try:
+            if _root is not None and not _work_shutting_down:
+                _root.after(WORK_TICK_MS, _work_tick)
+        except tk.TclError:
+            pass
+
+
+def _work_start_feature():
+    """Called once from main(), after the Tk root exists: load the state, start the hooks and the tick."""
+    try:
+        _work_load_state()
+        _work_start_background()
+        _root.after(WORK_TICK_MS, _work_tick)
+    except Exception as e:
+        _report_problem("Work timer start", exc=e, counts_as_failure=False)
+
+
+def _tray_open_work(icon, item):
+    _ui_call(_work_open_window)
+
+
 def _build_tray_icon():
     menu = pystray.Menu(
         # default=True -> this is what a left-click/double-click on the
@@ -5267,6 +6362,7 @@ def _build_tray_icon():
         pystray.MenuItem("Dark mode", _tray_toggle_theme, checked=_tray_is_dark),
         pystray.MenuItem("Auto EN -> AR popup (on copy)", _tray_toggle_popup_auto_mode, checked=_tray_is_popup_auto_mode),
         pystray.MenuItem("Start with Windows", _tray_toggle_startup, checked=_tray_is_startup_enabled),
+        pystray.MenuItem("يلا نشتغل", _tray_open_work),
         pystray.MenuItem("Settings...", _tray_open_settings),
         pystray.MenuItem("Check for updates", lambda icon, item: _check_for_update_manual()),
         pystray.MenuItem("Exit", _tray_exit),
@@ -5953,6 +7049,7 @@ def main():
     _build_main_window(_root)
     _pump_ui_queue()  # starts the background -> UI task pump
     _start_single_instance_listener()  # a second launch brings this window to the front
+    _work_start_feature()  # "يلا نشتغل": load the saved timer, start the send counter + the tick
     _refresh_usage(force=True)
     _root.after(5000, _schedule_update_checks)  # first update check ~5s after launch
 
@@ -6008,6 +7105,10 @@ def main():
     except KeyboardInterrupt:
         safe_print("Program stopped by user.")
     finally:
+        try:
+            _work_shutdown()
+        except Exception:
+            pass
         try:
             _popup_watcher_stop_event.set()
             keyboard.unhook_all()
