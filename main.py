@@ -190,7 +190,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.11"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -5561,6 +5561,35 @@ def _launch_silent_installer(setup_path: str):
                      close_fds=True)
 
 
+def _open_update_stream(url: str, resume_from: int = 0):
+    """
+    Open the download link. Tries Windows' own certificate store first, then
+    the 'certifi' bundle: on some PCs Windows lacks the root certificate the
+    GitHub download server uses, so Python fails while the browser works.
+    """
+    import ssl
+    contexts = [("Windows certificates", ssl.create_default_context())]
+    try:
+        import certifi
+        contexts.append(("certifi certificates", ssl.create_default_context(cafile=certifi.where())))
+    except Exception:
+        pass
+    last = None
+    for name, ctx in contexts:
+        try:
+            headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+            if resume_from:
+                headers["Range"] = f"bytes={resume_from}-"
+            request = urllib.request.Request(url, headers=headers)
+            return urllib.request.urlopen(request, timeout=UPDATE_DOWNLOAD_TIMEOUT_SECONDS, context=ctx)
+        except urllib.error.HTTPError:
+            raise   # the server answered - a different certificate will not help
+        except Exception as e:
+            last = e
+            _log_event("INFO", "Update download", f"{name}: {type(e).__name__}: {e}", "")
+    raise last
+
+
 def _download_and_install_update(url: str, latest: str):
     """Download the Setup with a progress bar, close this program, install silently, relaunch."""
     global _update_download_in_flight
@@ -5573,28 +5602,53 @@ def _download_and_install_update(url: str, latest: str):
     try:
         _log_event("INFO", "Downloading update", f"Version {latest}", "")
         _ui_call(_show_update_progress, latest)
-        request = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-        with urllib.request.urlopen(request, timeout=UPDATE_DOWNLOAD_TIMEOUT_SECONDS) as resp, \
-                open(target + ".part", "wb") as out:
+        part = target + ".part"
+        try:
+            os.remove(part)   # always start a fresh download; resuming is only for retries below
+        except OSError:
+            pass
+        done = 0
+        for attempt in range(1, 4):   # up to 3 tries; a retry continues where the last one stopped
+            if _update_cancel_event.is_set():
+                raise _UpdateCancelled()
             try:
-                total = int(resp.headers.get("Content-Length") or 0)
-            except ValueError:
-                total = 0
-            done = 0
-            last_ui = 0.0
-            while True:
-                if _update_cancel_event.is_set():
-                    raise _UpdateCancelled()
-                chunk = resp.read(1024 * 128)
-                if not chunk:
-                    break
-                out.write(chunk)
-                done += len(chunk)
-                now = time.time()
-                if now - last_ui >= 0.1:
-                    last_ui = now
-                    _ui_call(_set_update_progress, done, total)
-        if os.path.getsize(target + ".part") < 100 * 1024:
+                done = os.path.getsize(part) if os.path.exists(part) else 0
+                with _open_update_stream(url, resume_from=done) as resp:
+                    if done and getattr(resp, "status", 200) != 206:
+                        done = 0   # the server ignored the resume request: start over
+                    try:
+                        length = int(resp.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        length = 0
+                    total = done + length if length else 0
+                    last_ui = 0.0
+                    with open(part, "ab" if done else "wb") as out:
+                        while True:
+                            if _update_cancel_event.is_set():
+                                raise _UpdateCancelled()
+                            chunk = resp.read(1024 * 128)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            done += len(chunk)
+                            now = time.time()
+                            if now - last_ui >= 0.1:
+                                last_ui = now
+                                _ui_call(_set_update_progress, done, total)
+                break
+            except _UpdateCancelled:
+                raise
+            except urllib.error.HTTPError as e:
+                if e.code == 416 and os.path.exists(part):   # nothing left to resume from
+                    os.remove(part)
+                    continue
+                raise
+            except Exception as e:
+                _log_event("INFO", "Update download", f"Try {attempt}/3 failed: {type(e).__name__}: {e}", "")
+                if attempt == 3:
+                    raise
+                time.sleep(2)
+        if os.path.getsize(part) < 100 * 1024:
             raise RuntimeError("The downloaded file is too small to be the installer.")
         os.replace(target + ".part", target)
 
@@ -5615,6 +5669,7 @@ def _download_and_install_update(url: str, latest: str):
         _notify("Update", "Update cancelled.")
     except Exception as e:
         _ui_call(_close_update_progress)
+        _log_event("ERROR", "Update failed - details", f"{type(e).__name__}: {e}", "")
         _report_problem("Update failed", exc=e, counts_as_failure=False)
         # Fallback: let the browser download it instead (the browser often
         # works where the program's own download is blocked by the network).
