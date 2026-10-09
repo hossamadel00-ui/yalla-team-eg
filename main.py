@@ -190,7 +190,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -5404,34 +5404,145 @@ def _offer_update(latest: str, url: str, notes: str):
         _update_declined_version = latest
 
 
+_update_cancel_event = threading.Event()
+_update_progress_win = None
+_update_progress_bar = None
+_update_progress_label = None
+
+
+class _UpdateCancelled(Exception):
+    """The user pressed Cancel while the update was downloading."""
+
+
+def _show_update_progress(latest: str):
+    """Small 'Downloading update' window with a progress bar. Tk main thread only."""
+    global _update_progress_win, _update_progress_bar, _update_progress_label
+    try:
+        win = tk.Toplevel(_root)
+        win.title("Updating")
+        win.geometry("380x140")
+        win.resizable(False, False)
+        win.transient(_root)
+        win.protocol("WM_DELETE_WINDOW", _update_cancel_event.set)
+        tk.Label(win, text=f"Downloading version {latest}...", font=("Arial", 11, "bold")).pack(pady=(14, 4))
+        bar = ttk.Progressbar(win, orient="horizontal", length=330, mode="determinate", maximum=100)
+        bar.pack(pady=4)
+        label = tk.Label(win, text="Starting...", font=("Arial", 9))
+        label.pack()
+        ttk.Button(win, text="Cancel", command=_update_cancel_event.set).pack(pady=8)
+        _update_progress_win, _update_progress_bar, _update_progress_label = win, bar, label
+    except Exception as e:
+        safe_print(f"[INFO] Could not show the update window: {e}")
+
+
+def _set_update_progress(done: int, total: int):
+    """Move the bar. Tk main thread only."""
+    try:
+        if _update_progress_bar is None:
+            return
+        if total > 0:
+            _update_progress_bar["value"] = done * 100 / total
+            _update_progress_label.config(text=f"{done / 1048576:.1f} / {total / 1048576:.1f} MB  ({done * 100 // total}%)")
+        else:
+            _update_progress_label.config(text=f"{done / 1048576:.1f} MB")
+    except Exception:
+        pass
+
+
+def _set_update_progress_text(text: str):
+    """Change the line under the bar. Tk main thread only."""
+    try:
+        if _update_progress_label is not None:
+            _update_progress_label.config(text=text)
+    except Exception:
+        pass
+
+
+def _close_update_progress():
+    """Close the progress window. Tk main thread only."""
+    global _update_progress_win, _update_progress_bar, _update_progress_label
+    try:
+        if _update_progress_win is not None:
+            _update_progress_win.destroy()
+    except Exception:
+        pass
+    _update_progress_win = _update_progress_bar = _update_progress_label = None
+
+
+def _launch_silent_installer(setup_path: str):
+    """
+    Run the Setup silently AFTER this program has closed, then start the
+    new version again. Done through a small detached 'cmd' so it keeps
+    running after we exit: wait ~3s -> run Setup and wait for it to
+    finish -> launch the program.
+    """
+    import subprocess
+    flags = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS"
+    cmd = f'ping -n 4 127.0.0.1 >nul & start /wait "" "{setup_path}" {flags}'
+    if getattr(sys, "frozen", False):  # built exe: start the program again afterwards
+        cmd += f' & start "" "{sys.executable}"'
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    CREATE_NO_WINDOW = 0x08000000
+    subprocess.Popen(f'cmd.exe /s /c "{cmd}"',
+                     creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                     close_fds=True)
+
+
 def _download_and_install_update(url: str, latest: str):
-    """Download the Setup to the TEMP folder, run it, and close this program."""
+    """Download the Setup with a progress bar, close this program, install silently, relaunch."""
     global _update_download_in_flight
     if _update_download_in_flight:
         return
     _update_download_in_flight = True
+    _update_cancel_event.clear()
+    target = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")),
+                          f"YallaTeamEG_Setup_{latest}.exe")
     try:
-        _notify("Update", f"Downloading version {latest}...")
         _log_event("INFO", "Downloading update", f"Version {latest}", "")
-        target = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")),
-                              f"YallaTeamEG_Setup_{latest}.exe")
+        _ui_call(_show_update_progress, latest)
         request = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
         with urllib.request.urlopen(request, timeout=UPDATE_DOWNLOAD_TIMEOUT_SECONDS) as resp, \
                 open(target + ".part", "wb") as out:
+            try:
+                total = int(resp.headers.get("Content-Length") or 0)
+            except ValueError:
+                total = 0
+            done = 0
+            last_ui = 0.0
             while True:
-                chunk = resp.read(1024 * 256)
+                if _update_cancel_event.is_set():
+                    raise _UpdateCancelled()
+                chunk = resp.read(1024 * 128)
                 if not chunk:
                     break
                 out.write(chunk)
+                done += len(chunk)
+                now = time.time()
+                if now - last_ui >= 0.1:
+                    last_ui = now
+                    _ui_call(_set_update_progress, done, total)
         if os.path.getsize(target + ".part") < 100 * 1024:
             raise RuntimeError("The downloaded file is too small to be the installer.")
         os.replace(target + ".part", target)
 
-        _log_event("OK", "Update downloaded", f"Starting the installer for {latest}", "")
-        os.startfile(target)  # Windows: opens the Setup (it asks for admin rights if needed)
-        time.sleep(1.5)
+        _ui_call(_set_update_progress, done, done or 1)
+        _ui_call(_set_update_progress_text, "Installing... the program will restart by itself.")
+        _log_event("OK", "Update downloaded", f"Installing {latest} silently", "")
+        _launch_silent_installer(target)
+        time.sleep(1.0)
         _ui_call(_quit_for_update)
+        time.sleep(4.0)
+        os._exit(0)  # safety net: make sure we are really closed so the Setup can replace the files
+    except _UpdateCancelled:
+        _ui_call(_close_update_progress)
+        try:
+            os.remove(target + ".part")
+        except OSError:
+            pass
+        _notify("Update", "Update cancelled.")
     except Exception as e:
+        _ui_call(_close_update_progress)
         _report_problem("Update failed", exc=e, counts_as_failure=False)
         # Fallback: let the browser download it instead (the browser often
         # works where the program's own download is blocked by the network).
