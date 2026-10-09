@@ -190,7 +190,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -4895,6 +4895,29 @@ def _build_main_window(root):
                               relief="flat", cursor="hand2", padx=8, command=_toggle_theme)
     _theme_button.pack(side="top", anchor="e")
 
+    # ---- "New version" strip (hidden until an update is found) ----
+    global _update_banner, _update_banner_label, _update_banner_anchor
+    _banner_bg, _banner_hover = "#1b8a3a", "#167030"
+    _update_banner = tk.Frame(root, bg=_banner_bg, cursor="hand2")
+    _theme_skip.add(str(_update_banner))   # keeps its own green in both modes
+    _update_banner_label = tk.Label(_update_banner, text="", font=("Segoe UI", 10, "bold"),
+                                    fg="white", bg=_banner_bg, anchor="w", padx=14, pady=7,
+                                    cursor="hand2")
+    _update_banner_label.pack(side="left", fill="x", expand=True)
+    _banner_close = tk.Label(_update_banner, text="✕", font=("Segoe UI", 10, "bold"),
+                             fg="white", bg=_banner_bg, padx=12, pady=7, cursor="hand2")
+    _banner_close.pack(side="right")
+    _update_banner_anchor = header
+
+    def _banner_color(color):
+        for w in (_update_banner, _update_banner_label, _banner_close):
+            w.config(bg=color)
+    for w in (_update_banner, _update_banner_label):
+        w.bind("<Button-1>", _on_update_banner_click)
+        w.bind("<Enter>", lambda e: _banner_color(_banner_hover))
+        w.bind("<Leave>", lambda e: _banner_color(_banner_bg))
+    _banner_close.bind("<Button-1>", lambda e: _hide_update_banner(dismiss=True))
+
     # ---- Live status line ----
     _status_var = tk.StringVar(value="Running - no problems so far.")
     tk.Label(root, textvariable=_status_var, font=("Segoe UI", 10, "bold"),
@@ -5410,6 +5433,56 @@ def _version_tuple(version_text) -> tuple:
     return tuple(int(p) for p in parts) if parts else (0,)
 
 
+_update_banner = None            # the green "new version" strip under the header
+_update_banner_label = None
+_update_banner_anchor = None     # the header frame: the strip is packed right after it
+_update_banner_visible = False
+_update_banner_dismissed = ""    # version whose strip the user closed (this session)
+_update_toasted_version = ""     # version we already sent a tray notification for
+_update_pending = None           # (version, url, notes) of the newest update found
+
+
+def _show_update_banner(latest: str, url: str, notes: str):
+    """Show the 'update available' strip. Tk main thread only."""
+    global _update_pending, _update_banner_visible
+    _update_pending = (latest, url, notes)
+    if _update_banner is None or _update_banner_dismissed == latest:
+        return
+    try:
+        _update_banner_label.config(text=f"🔔  New version {latest} is available  -  click here to update")
+        if not _update_banner_visible:
+            _update_banner.pack(fill="x", after=_update_banner_anchor)
+            _update_banner_visible = True
+    except tk.TclError:
+        pass
+
+
+def _hide_update_banner(dismiss: bool = False):
+    """Hide the strip. dismiss=True: the user closed it, so it stays hidden for this version."""
+    global _update_banner_visible, _update_banner_dismissed
+    if dismiss and _update_pending:
+        _update_banner_dismissed = _update_pending[0]
+    try:
+        if _update_banner is not None and _update_banner_visible:
+            _update_banner.pack_forget()
+        _update_banner_visible = False
+    except tk.TclError:
+        pass
+
+
+def _on_update_banner_click(event=None):
+    if _update_pending:
+        _offer_update(*_update_pending)
+
+
+def _notify_update_once(latest: str):
+    """One tray/toast message per new version (for people whose window is hidden in the tray)."""
+    global _update_toasted_version
+    if _update_toasted_version != latest:
+        _update_toasted_version = latest
+        _notify("Update available", f"Version {latest} is ready. Open the program and click the green bar to update.")
+
+
 def _check_for_update(manual: bool = False):
     """
     Runs on a background thread. Downloads version.json and, if it
@@ -5445,12 +5518,16 @@ def _check_for_update(manual: bool = False):
                              f"Version {latest} is announced, but its download link is not ready yet. "
                              "Try again a bit later.")
                 return
-            if not manual and latest == _update_declined_version:
-                return  # the user already said "No" to this one in this session
-            _ui_call(_offer_update, latest, url, notes)
-        elif manual:
-            _ui_call(messagebox.showinfo, "Update",
-                     f"You already have the latest version ({APP_VERSION}).")
+            _ui_call(_show_update_banner, latest, url, notes)   # always: the green strip in the window
+            if manual:
+                _ui_call(_offer_update, latest, url, notes)      # they asked: show the question box too
+            else:
+                _ui_call(_notify_update_once, latest)            # automatic check: no pop-up, just a notice
+        else:
+            _ui_call(_hide_update_banner)
+            if manual:
+                _ui_call(messagebox.showinfo, "Update",
+                         f"You already have the latest version ({APP_VERSION}).")
     except Exception as e:
         safe_print(f"[INFO] Update check failed: {e}")
         if manual:
