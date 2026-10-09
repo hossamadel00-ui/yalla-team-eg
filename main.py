@@ -190,7 +190,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -4154,6 +4154,55 @@ _DANGER_COLORS = {"#b3261e", "#ff7b72"}
 _PLAIN_FG_COLORS = {"", "black", "#000000", "#000", "systemwindowtext", "systembuttontext", "#e8e8e8"}
 
 
+# ---- Main action buttons: flat, colored by what they do ----------------
+# role -> (background, hover background, text color), one set per mode
+_BUTTON_STYLES = {
+    "light": {
+        "primary": ("#0f5d8c", "#0c4a70", "#ffffff"),   # Settings
+        "stop":    ("#c0392b", "#a93226", "#ffffff"),   # Disable (program is on)
+        "start":   ("#1b8a3a", "#167030", "#ffffff"),   # Enable  (program is off)
+        "neutral": ("#e2e6ea", "#d1d7dd", "#1f2023"),   # Retry last, more menu
+    },
+    "dark": {
+        "primary": ("#1f7fb8", "#2f92cc", "#ffffff"),
+        "stop":    ("#c0463d", "#d85a50", "#ffffff"),
+        "start":   ("#2e9e5b", "#3bb26b", "#ffffff"),
+        "neutral": ("#3a3d43", "#4a4e55", "#e8e8e8"),
+    },
+}
+_BUTTON_ROLES = set(_BUTTON_STYLES["light"])
+
+
+def _paint_button(btn):
+    """Give a styled button the colors of its role for the current mode."""
+    role = getattr(btn, "_theme_role", None)
+    if role not in _BUTTON_ROLES:
+        return
+    bg, hover, fg = _BUTTON_STYLES[_theme_name][role]
+    _cfg(btn, bg=bg, fg=fg, activebackground=hover, activeforeground=fg,
+         highlightbackground=bg, disabledforeground=fg)
+
+
+def _button_hover(btn, inside: bool):
+    try:
+        role = getattr(btn, "_theme_role", None)
+        if role not in _BUTTON_ROLES or str(btn.cget("state")) == "disabled":
+            return
+        bg, hover, _fg = _BUTTON_STYLES[_theme_name][role]
+        btn.config(bg=hover if inside else bg)
+    except tk.TclError:
+        pass
+
+
+def _style_button(btn, role: str, font=("Segoe UI", 10, "bold")):
+    """Flat, hand-cursor button with a hover color. role = primary / stop / start / neutral."""
+    btn._theme_role = role
+    _cfg(btn, relief="flat", bd=0, highlightthickness=0, cursor="hand2", font=font, padx=10)
+    btn.bind("<Enter>", lambda e, b=btn: _button_hover(b, True))
+    btn.bind("<Leave>", lambda e, b=btn: _button_hover(b, False))
+    _paint_button(btn)
+
+
 def _theme_fg_for(current, pal):
     """Map a widget's current text color to the matching palette color (None = leave it)."""
     cur = str(current).strip().lower()
@@ -4268,11 +4317,14 @@ def _theme_walk(widget, pal):
         if fg:
             _cfg(widget, fg=fg)
     elif cls == "Button":
-        _cfg(widget, bg=pal["button"], activebackground=pal["button_active"],
-             highlightbackground=pal["bg"])
-        fg = _theme_fg_for(widget.cget("fg"), pal)
-        if fg:
-            _cfg(widget, fg=fg, activeforeground=fg)
+        if role in _BUTTON_ROLES:
+            _paint_button(widget)
+        else:
+            _cfg(widget, bg=pal["button"], activebackground=pal["button_active"],
+                 highlightbackground=pal["bg"])
+            fg = _theme_fg_for(widget.cget("fg"), pal)
+            if fg:
+                _cfg(widget, fg=fg, activeforeground=fg)
     elif cls in ("Checkbutton", "Radiobutton"):
         _cfg(widget, bg=pal["bg"], activebackground=pal["bg"], selectcolor=pal["field"],
              highlightbackground=pal["bg"])
@@ -4530,6 +4582,8 @@ def _refresh_main_window():
         _info_var.set(_current_info_text())
     if _enable_button is not None:
         _enable_button.config(text="Disable" if _enabled else "Enable")
+        _enable_button._theme_role = "stop" if _enabled else "start"
+        _paint_button(_enable_button)
     if _state_label is not None:
         _state_label.config(text="●  Enabled" if _enabled else "●  Disabled",
                             fg="#7ee2a8" if _enabled else "#ffb4a8")
@@ -4911,13 +4965,17 @@ def _build_main_window(root):
         _actions_row.columnconfigure(column, weight=1, uniform="actions")
     _enable_button = tk.Button(_actions_row, text="Disable" if _enabled else "Enable",
                                command=_toggle_enabled_from_window)
-    _enable_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), ipady=3)
-    tk.Button(_actions_row, text="Retry last", command=_retry_last_job).grid(
-        row=0, column=1, sticky="ew", padx=6, ipady=3)
-    tk.Button(_actions_row, text="Settings...", command=_open_settings_window).grid(
-        row=0, column=2, sticky="ew", padx=6, ipady=3)
-    more_button = tk.Button(_actions_row, text="⋯", width=4, font=("Segoe UI", 11, "bold"))
-    more_button.grid(row=0, column=3, padx=(6, 0))
+    _style_button(_enable_button, "stop" if _enabled else "start")
+    _enable_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), ipady=6)
+    _retry_button = tk.Button(_actions_row, text="↻  Retry last", command=_retry_last_job)
+    _style_button(_retry_button, "neutral")
+    _retry_button.grid(row=0, column=1, sticky="ew", padx=6, ipady=6)
+    _settings_button = tk.Button(_actions_row, text="⚙  Settings", command=_open_settings_window)
+    _style_button(_settings_button, "primary")
+    _settings_button.grid(row=0, column=2, sticky="ew", padx=6, ipady=6)
+    more_button = tk.Button(_actions_row, text="⋯", width=4)
+    _style_button(more_button, "neutral", font=("Segoe UI", 12, "bold"))
+    more_button.grid(row=0, column=3, padx=(6, 0), ipady=3)
     more_menu = tk.Menu(root, tearoff=0)
     more_menu.add_command(label="Minimize to tray", command=_hide_to_tray)
     more_menu.add_command(label="Check for updates", command=_check_for_update_manual)
