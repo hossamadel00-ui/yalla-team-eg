@@ -190,7 +190,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -4579,6 +4579,14 @@ def _log_event_on_main_thread(level: str, where: str, cause: str, quick_fix: str
             )
             widget.window_create("end", window=star_btn)
             _theme_apply_to(star_btn)
+
+            # Copy button: puts this translation on the clipboard with one click
+            copy_btn = tk.Button(
+                widget, text="📋", font=("Segoe UI", 9), relief="flat", cursor="hand2",
+                command=lambda text=cause: _copy_translation_to_clipboard(text),
+            )
+            widget.window_create("end", window=copy_btn)
+            _theme_apply_to(copy_btn)
             widget.insert("end", f"  {cause}\n\n")
             widget.see("end")
             widget.config(state="disabled")
@@ -4597,6 +4605,12 @@ def _log_event_on_main_thread(level: str, where: str, cause: str, quick_fix: str
 
     if _status_var is not None:
         _status_var.set(f"{level}: {where}" if level != "OK" else f"OK - {where}")
+
+
+def _copy_translation_to_clipboard(text: str):
+    """The 📋 button next to a translation: copy it (never auto-typed)."""
+    if _set_clipboard_text(text):
+        _notify("Copied", "The translation is on your clipboard.")
 
 
 def _add_favorite(text: str):
