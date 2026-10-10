@@ -192,7 +192,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.19"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -5338,7 +5338,7 @@ _WORK_CLICK_MIN_GREEN = 8    # ...and needs this many green samples (the white a
 _WORK_ENTER_STEP = 5         # Enter check: coarse grid over the lower-right part of the window
 _WORK_ENTER_MIN_GREEN = 10
 _WORK_ENTER_SCAN_X = (0.55, 1.0)   # fractions of the window width
-_WORK_ENTER_SCAN_Y = (0.65, 1.0)   # fractions of the window height
+_WORK_ENTER_SCAN_Y = (0.35, 1.0)   # fractions of the window height (the arrow moves UP when the emoji panel / keyboard is open)
 # While the phone keyboard's white typing bar (with "OK") is open, it covers almost the
 # whole green arrow: only a ~4 px sliver peeks out above the bar. So if the coarse scan
 # finds nothing, a second, finer scan looks at the bottom-right corner of the window.
@@ -6014,7 +6014,7 @@ def _work_find_send_button(rect):
 def _work_click_hits_send_button(rect, x: int, y: int) -> bool:
     """Strict click check: is the click ON a send-arrow shaped blob (and in the lower-right zone)?"""
     width, height = rect.right - rect.left, rect.bottom - rect.top
-    if x < rect.left + width * 0.45 or y < rect.top + height * 0.55 or x > rect.right or y > rect.bottom:
+    if x < rect.left + width * 0.45 or y < rect.top + height * 0.30 or x > rect.right or y > rect.bottom:
         return False
     radius = 56
     side = 2 * radius + 1
