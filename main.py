@@ -192,7 +192,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.15"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -5347,9 +5347,12 @@ _work_toast_win = None
 _work_mouse_hook = None
 _work_mouse_thread_id = 0
 _work_hook_proc_ref = None            # keep the ctypes callback alive
+_work_plus_win = None                 # the little "+1" that floats where a send was counted
+_work_mini_win = None                 # the small movable time + count box ("تصغير")
+_work_mini_ui = {}
 _work_cfg = {"minutes": WORK_DEFAULT_DURATION_MINUTES, "threshold": WORK_DEFAULT_THRESHOLD,
              "emulators": [WORK_DEFAULT_EMULATORS], "emulators_text": WORK_DEFAULT_EMULATORS,
-             "color_check": True}
+             "color_check": True, "strict_shape": True, "show_plus": True}
 
 
 def _work_default_state(duration_seconds: float) -> dict:
@@ -5398,6 +5401,8 @@ def _work_cfg_reload():
             "emulators": names,
             "emulators_text": ", ".join(names),
             "color_check": bool(cfg.get("work_color_check", True)),
+            "strict_shape": bool(cfg.get("work_strict_shape", True)),
+            "show_plus": bool(cfg.get("work_show_plus", True)),
         })
     except Exception as e:
         safe_print(f"[WARNING] Could not read the work-timer settings: {e}")
@@ -5643,8 +5648,9 @@ def _work_load_state():
 
 
 # ----------------------------------------------------------- send counting
-def _work_register_send(stamp: float) -> bool:
-    """One detected send. Worker thread. Two sends within ~0.33 s are ONE message."""
+def _work_register_send(stamp: float, pos=None) -> bool:
+    """One detected send. Worker thread. Two sends within ~0.33 s are ONE message.
+    'pos' = (x, y) on the screen where it was counted: the small "+1" appears there."""
     global _work_last_counted
     with _work_lock:
         if stamp - _work_last_counted < WORK_DOUBLE_SEND_SECONDS:
@@ -5653,6 +5659,8 @@ def _work_register_send(stamp: float) -> bool:
         _work["count"] = int(_work["count"]) + 1
         count = _work["count"]
     _work_save()   # throttled
+    if _work_cfg.get("show_plus", True):
+        _ui_call(_work_show_plus, pos, count)
     threshold = _work_cfg["threshold"]
     if threshold > 0 and count % threshold == 0:
         _ui_call(_work_show_toast, f"خلصت {count} رسالة")
@@ -5831,6 +5839,186 @@ def _work_green_blob_in_window(rect) -> bool:
                              x_from=band_x, y_from=band_y, step_y=1) >= _WORK_ENTER_BAND_MIN_GREEN
 
 
+# ---- SHAPE detection of the send arrow (pure functions: they only read a pixel buffer) ----
+# Why: "some green pixels in the corner" is fooled by anything green in the game - green
+# buttons, trees, colored chat names or emoji in the closed-chat strip - so Enter / clicks got
+# counted even with the chat closed. The real send arrow is a green ROUND button with a WHITE
+# arrow in the middle, so we look for that shape instead:
+#   * whole button visible  -> a compact, roughly round green blob with white inside it;
+#   * typing bar open       -> the bar hides the button except a thin round "cap" on top:
+#                              a short, wide blob, flat at the bottom and narrower at the top.
+# Anything else (rectangles, bars, scattered text, tiny emoji) is rejected.
+# BEGIN-SHAPE-DETECTION
+def _work_green_blobs(data: bytes, w: int, h: int, step_x: int, step_y: int,
+                      x_from: int = 0, y_from: int = 0, max_blobs: int = 80) -> list:
+    """
+    Group the green samples of a grid into connected blobs (8 neighbours). Each blob is a dict:
+    pixel box x0,y0,x1,y1 (inside the buffer), n = samples, cw/ch = box size in samples,
+    rows = how many samples each row of the box has (top to bottom).
+    """
+    gw = (w - x_from + step_x - 1) // step_x
+    gh = (h - y_from + step_y - 1) // step_y
+    if gw <= 0 or gh <= 0:
+        return []
+    mask = bytearray(gw * gh)
+    row_bytes = w * 4
+    for gy in range(gh):
+        base = (y_from + gy * step_y) * row_bytes + x_from * 4
+        mrow = gy * gw
+        for gx in range(gw):
+            i = base + gx * step_x * 4
+            b, g, r = data[i], data[i + 1], data[i + 2]
+            if g > r and g > b and _work_is_green(r, g, b):
+                mask[mrow + gx] = 1
+    blobs = []
+    start = mask.find(1)
+    while start != -1 and len(blobs) < max_blobs:
+        mask[start] = 2
+        stack = [start]
+        cells = []
+        while stack:
+            c = stack.pop()
+            cells.append(c)
+            cy, cx = divmod(c, gw)
+            for ny in (cy - 1, cy, cy + 1):
+                if ny < 0 or ny >= gh:
+                    continue
+                nbase = ny * gw
+                for nx in (cx - 1, cx, cx + 1):
+                    if 0 <= nx < gw and mask[nbase + nx] == 1:
+                        mask[nbase + nx] = 2
+                        stack.append(nbase + nx)
+        xs = [c % gw for c in cells]
+        ys = [c // gw for c in cells]
+        min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+        per_row = [0] * (max_y - min_y + 1)
+        for y in ys:
+            per_row[y - min_y] += 1
+        blobs.append({
+            "x0": x_from + min_x * step_x, "x1": x_from + (max_x + 1) * step_x,
+            "y0": y_from + min_y * step_y, "y1": y_from + (max_y + 1) * step_y,
+            "n": len(cells), "cw": max_x - min_x + 1, "ch": max_y - min_y + 1, "rows": per_row,
+        })
+        start = mask.find(1, start + 1)
+    return blobs
+
+
+def _work_has_white_inside(data: bytes, w: int, blob: dict) -> bool:
+    """Is there white (the arrow) in the middle of the blob's box?"""
+    mx = (blob["x1"] - blob["x0"]) // 4
+    my = (blob["y1"] - blob["y0"]) // 4
+    found = 0
+    for y in range(blob["y0"] + my, blob["y1"] - my):
+        base = y * w * 4
+        for x in range(blob["x0"] + mx, blob["x1"] - mx):
+            i = base + x * 4
+            if data[i] >= 200 and data[i + 1] >= 200 and data[i + 2] >= 200:
+                found += 1
+                if found >= 4:
+                    return True
+    return False
+
+
+def _work_blob_verdict(blob: dict, data: bytes, w: int, window_w: int) -> tuple:
+    """('circle' | 'cap' | '', why). Is this green blob the send arrow (whole, or only its top edge)?"""
+    bw, bh = blob["x1"] - blob["x0"], blob["y1"] - blob["y0"]
+    if bw <= 0 or bh <= 0:
+        return "", "empty"
+    fill = blob["n"] / float(blob["cw"] * blob["ch"])
+    ratio = bw / float(bh)
+    min_d = max(14.0, window_w * 0.04)
+    max_d = min(110.0, max(70.0, window_w * 0.18))
+    if min_d <= bw <= max_d and min_d <= bh <= max_d:
+        if not 0.7 <= ratio <= 1.43:
+            return "", f"not round (w/h={ratio:.2f})"
+        if not 0.35 <= fill <= 0.90:
+            return "", f"wrong fill ({fill:.2f})"
+        if not _work_has_white_inside(data, w, blob):
+            return "", "no white arrow inside"
+        return "circle", f"round {bw}x{bh}, fill {fill:.2f}"
+    rows = blob["rows"]
+    if 10 <= bw <= max_d and 2 <= bh <= 14 and ratio >= 2.5 and len(rows) >= 2 and blob["n"] >= 6:
+        if not 0.45 <= fill <= 0.95:
+            return "", f"thin, wrong fill ({fill:.2f})"
+        if rows[-1] >= 0.75 * max(rows) and rows[0] <= 0.85 * rows[-1]:
+            return "cap", f"top edge {bw}x{bh}, fill {fill:.2f}"
+        return "", "thin, not a round top edge"
+    return "", f"size {bw}x{bh} does not fit"
+
+
+def _work_best_blob(data: bytes, w: int, h: int, window_w: int, step_x: int, step_y: int,
+                    x_from: int, y_from: int, origin_x: int, origin_y: int):
+    """Scan a grid; return (kind, screen_x, screen_y) of the best send-arrow blob, or None."""
+    best = None
+    for blob in _work_green_blobs(data, w, h, step_x, step_y, x_from, y_from):
+        kind, _why = _work_blob_verdict(blob, data, w, window_w)
+        if not kind:
+            continue
+        found = (kind, origin_x + (blob["x0"] + blob["x1"]) // 2, origin_y + (blob["y0"] + blob["y1"]) // 2)
+        if kind == "circle":
+            return found
+        best = best or found
+    return best
+
+
+def _work_scan_step(w: int, h: int) -> int:
+    """Grid step for a region: ~20k-80k samples however big the window is."""
+    return max(2, min(5, int(math.sqrt(max(1, w * h) / 25000.0))))
+
+
+def _work_find_send_button(rect):
+    """Strict Enter check. (kind, screen_x, screen_y) of the send arrow in the emulator window, or None."""
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width < 120 or height < 120:
+        return None
+    x0 = rect.left + int(width * _WORK_ENTER_SCAN_X[0])
+    x1 = rect.left + int(width * _WORK_ENTER_SCAN_X[1])
+    y0 = rect.top + int(height * _WORK_ENTER_SCAN_Y[0])
+    y1 = rect.top + int(height * _WORK_ENTER_SCAN_Y[1])
+    w, h = min(x1 - x0, 1600), min(y1 - y0, 1200)
+    data = _work_grab(x0, y0, w, h)
+    if not data:
+        return None
+    step = _work_scan_step(w, h)
+    found = _work_best_blob(data, w, h, width, step, step, 0, 0, x0, y0)
+    if found:
+        return found
+    # Typing bar open: only the button's top edge shows. Fine scan of the bottom-right band
+    # (rows one by one, because that edge is only ~4 px tall).
+    band_x = max(0, int(width * _WORK_ENTER_BAND_X) - (x0 - rect.left))
+    band_y = max(0, int(height * _WORK_ENTER_BAND_Y) - (y0 - rect.top))
+    return _work_best_blob(data, w, h, width, 2, 1, band_x, band_y, x0, y0)
+
+
+def _work_click_hits_send_button(rect, x: int, y: int) -> bool:
+    """Strict click check: is the click ON a send-arrow shaped blob (and in the lower-right zone)?"""
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if x < rect.left + width * 0.45 or y < rect.top + height * 0.55 or x > rect.right or y > rect.bottom:
+        return False
+    radius = 56
+    side = 2 * radius + 1
+    data = _work_grab(x - radius, y - radius, side, side)
+    if not data:
+        return False
+    for blob in _work_green_blobs(data, side, side, 2, 2):
+        if blob["x0"] - 4 <= radius <= blob["x1"] + 4 and blob["y0"] - 4 <= radius <= blob["y1"] + 4:
+            if _work_blob_verdict(blob, data, side, width)[0]:
+                return True
+    return False
+# END-SHAPE-DETECTION
+
+
+def _work_cursor_pos():
+    """Current mouse position (x, y) or None."""
+    try:
+        pt = wintypes.POINT()
+        if _w_user32.GetCursorPos(ctypes.byref(pt)):
+            return (pt.x, pt.y)
+    except Exception:
+        pass
+    return None
+
+
 def _work_foreground_emulator_rect():
     """The foreground window's rectangle if it belongs to a configured emulator, else None."""
     name = _get_foreground_process_name()
@@ -5852,19 +6040,32 @@ def _work_handle_event(event):
     if rect is None:
         return                                  # emulator is not in front: no counting
     check_color = _work_cfg["color_check"]
+    strict = _work_cfg.get("strict_shape", True)
+    pos = None                                  # where the little "+1" will appear
     if kind == "enter":
-        if check_color and not _work_green_blob_in_window(rect):
-            return
+        if check_color:
+            if strict:
+                found = _work_find_send_button(rect)     # a round green arrow (or its top edge)
+                if found is None:
+                    return
+                pos = (found[1], found[2])
+            elif not _work_green_blob_in_window(rect):   # old rule: any green in the corner
+                return
+        pos = pos or _work_cursor_pos()
     elif kind == "click":
         x, y = event[1], event[2]
         if check_color:
-            if not _work_click_is_send_button(x, y):
+            if strict:
+                if not _work_click_hits_send_button(rect, x, y):
+                    return
+            elif not _work_click_is_send_button(x, y):
                 return
         elif not (rect.left <= x <= rect.right and rect.top <= y <= rect.bottom):
             return                              # fallback mode: any click INSIDE the emulator window
+        pos = (x, y)
     else:
         return
-    _work_register_send(stamp)
+    _work_register_send(stamp, pos)
 
 
 def _work_worker_loop():
@@ -6052,6 +6253,194 @@ def _work_show_toast(text: str):
         safe_print(f"[WARNING] Work counter popup failed: {e}")
 
 
+def _work_show_plus(pos=None, count=None):
+    """
+    A tiny "+N" (N = the new total, e.g. +100, +101, +102) that appears just above the place where a send was counted (below it when there is
+    no room above), drifts away and fades out in under a second. Never takes the keyboard focus.
+    Tk main thread only.
+    """
+    global _work_plus_win
+    if not _work_cfg.get("show_plus", True) or _root is None:
+        return
+    try:
+        if _work_plus_win is not None and _work_plus_win.winfo_exists():
+            _work_plus_win.destroy()
+    except tk.TclError:
+        pass
+    try:
+        win = tk.Toplevel(_root)
+        _work_plus_win = win
+        _theme_skip.add(str(win))
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#1b8a3a")
+        tk.Label(win, text=f"+{count}" if count is not None else "+1", font=("Segoe UI", 13, "bold"), fg="white", bg="#1b8a3a",
+                 padx=9, pady=1).pack()
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        screen_w, screen_h = win.winfo_screenwidth(), win.winfo_screenheight()
+        px, py = pos if pos else (screen_w // 2, screen_h // 2)
+        x = min(max(int(px - w / 2), 0), max(0, screen_w - w))
+        y = int(py - h - 34)                      # above the spot...
+        direction = -1
+        if y < 0:                                 # ...or below it when there is no room above
+            y = int(py + 34)
+            direction = 1
+        y = min(max(y, 0), max(0, screen_h - h))
+        win.geometry(f"+{x}+{y}")
+        _work_no_activate(win)
+        steps = 18
+
+        def animate(i):
+            try:
+                if not win.winfo_exists():
+                    return
+                if i >= steps:
+                    win.destroy()
+                    return
+                win.geometry(f"+{x}+{y + direction * int(i * 0.9)}")
+                try:
+                    win.attributes("-alpha", max(0.0, 1.0 - max(0, i - 6) / float(steps - 6)))
+                except tk.TclError:
+                    pass
+                win.after(35, lambda: animate(i + 1))
+            except tk.TclError:
+                pass
+
+        win.after(250, lambda: animate(0))       # stays still for a moment so it can be read
+    except Exception as e:
+        safe_print(f"[WARNING] Work counter +1 popup failed: {e}")
+
+
+# ----------------------------------------------- mini box ("تصغير"): time + count only
+_WORK_MINI_BG = "#1e1f23"
+_WORK_STATUS_DOT = {"running": "#3ddc84", "paused": "#f0a04f", "stopped": "#8a8f98", "finished": "#ff6b61"}
+
+
+def _work_mini_clamp(x: int, y: int, w: int, h: int) -> tuple:
+    screen_w, screen_h = _root.winfo_screenwidth(), _root.winfo_screenheight()
+    return min(max(int(x), 0), max(0, screen_w - w)), min(max(int(y), 0), max(0, screen_h - h))
+
+
+def _work_mini_hide(restore: bool = True):
+    """Close the small box and (by default) bring the big window back."""
+    global _work_mini_win
+    try:
+        if _work_mini_win is not None and _work_mini_win.winfo_exists():
+            _work_mini_win.destroy()
+    except tk.TclError:
+        pass
+    _work_mini_win = None
+    _work_mini_ui.clear()
+    if restore:
+        try:
+            if _work_win is not None and _work_win.winfo_exists():
+                _work_win.deiconify()
+                _work_win.lift()
+                _work_win.focus_force()
+            else:
+                _work_open_window()
+        except tk.TclError:
+            pass
+
+
+def _work_mini_show():
+    """'تصغير': hide the big window; show only the time and the count in a small box that can be dragged anywhere."""
+    global _work_mini_win
+    try:
+        if _work_mini_win is not None and _work_mini_win.winfo_exists():
+            return
+    except tk.TclError:
+        pass
+    try:
+        win = tk.Toplevel(_root)
+        _work_mini_win = win
+        _theme_skip.add(str(win))
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-alpha", 0.94)
+        except tk.TclError:
+            pass
+        win.configure(bg=_WORK_MINI_BG)
+        frame = tk.Frame(win, bg=_WORK_MINI_BG, highlightthickness=1, highlightbackground="#3a3d43")
+        frame.pack(fill="both", expand=True)
+        dot = tk.Label(frame, text="●", font=("Segoe UI", 10), fg="#8a8f98", bg=_WORK_MINI_BG)
+        dot.pack(side="left", padx=(10, 4))
+        timer = tk.Label(frame, text="00:00:00", font=("Consolas", 16, "bold"), fg="#ffffff", bg=_WORK_MINI_BG)
+        timer.pack(side="left")
+        tk.Label(frame, text="│", font=("Segoe UI", 14), fg="#4a4e55", bg=_WORK_MINI_BG).pack(side="left", padx=8)
+        count = tk.Label(frame, text="0", font=("Segoe UI", 16, "bold"), fg="#7ee787", bg=_WORK_MINI_BG)
+        count.pack(side="left")
+        restore = tk.Label(frame, text="□", font=("Segoe UI", 12, "bold"), fg="#a0a4aa", bg=_WORK_MINI_BG,
+                           cursor="hand2", padx=8)
+        restore.pack(side="left", padx=(6, 4))
+        restore.bind("<Button-1>", lambda e: _work_mini_hide(True))
+        restore.bind("<Enter>", lambda e: restore.config(fg="#ffffff"))
+        restore.bind("<Leave>", lambda e: restore.config(fg="#a0a4aa"))
+        _work_mini_ui.update({"dot": dot, "timer": timer, "count": count})
+
+        # Drag with the left mouse button from anywhere on the box; double-click = back to the big window.
+        drag = {"dx": 0, "dy": 0}
+
+        def press(e):
+            drag["dx"], drag["dy"] = e.x_root - win.winfo_x(), e.y_root - win.winfo_y()
+
+        def motion(e):
+            x, y = _work_mini_clamp(e.x_root - drag["dx"], e.y_root - drag["dy"],
+                                    win.winfo_width(), win.winfo_height())
+            win.geometry(f"+{x}+{y}")
+
+        def release(e):
+            try:
+                win.update_idletasks()      # make sure winfo_x/y report the final position
+                _save_config(work_mini_x=win.winfo_x(), work_mini_y=win.winfo_y())
+            except Exception:
+                pass
+
+        for widget in (frame, dot, timer, count):
+            widget.bind("<ButtonPress-1>", press)
+            widget.bind("<B1-Motion>", motion)
+            widget.bind("<ButtonRelease-1>", release)
+            widget.bind("<Double-Button-1>", lambda e: _work_mini_hide(True))
+
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        try:
+            cfg = _load_config()
+            x, y = int(cfg["work_mini_x"]), int(cfg["work_mini_y"])
+        except Exception:
+            x, y = _root.winfo_screenwidth() - w - 40, 40          # first time: top-right corner
+        x, y = _work_mini_clamp(x, y, w, h)
+        win.geometry(f"+{x}+{y}")
+        _work_no_activate(win)      # clicking/dragging it never takes the focus away from the emulator
+        if _work_win is not None and _work_win.winfo_exists():
+            _work_win.withdraw()
+        _work_refresh_mini()
+    except Exception as e:
+        _report_problem("Work timer mini box", exc=e, counts_as_failure=False)
+        _work_mini_hide(True)
+
+
+def _work_refresh_mini():
+    """Keep the small box in sync with the timer and the counter. Cheap; called by the tick."""
+    win = _work_mini_win
+    try:
+        if win is None or not win.winfo_exists() or not _work_mini_ui:
+            return
+        with _work_lock:
+            status, count = _work["status"], int(_work["count"])
+        timer_text = _work_format_hms(_work_remaining())
+        if _work_mini_ui["timer"].cget("text") != timer_text:
+            _work_mini_ui["timer"].config(text=timer_text)
+        if _work_mini_ui["count"].cget("text") != str(count):
+            _work_mini_ui["count"].config(text=str(count))
+        _work_mini_ui["dot"].config(fg=_WORK_STATUS_DOT.get(status, "#8a8f98"))
+        _work_mini_ui["timer"].config(fg="#ff6b61" if status == "finished" else "#ffffff")
+    except tk.TclError:
+        pass
+
+
 # ------------------------------------------------------------------ window
 def _work_format_hms(seconds: float) -> str:
     total = int(math.ceil(max(0.0, seconds) - 1e-6))
@@ -6146,7 +6535,9 @@ def _work_save_settings_from_window():
         say("المدة لازم تكون دقيقة على الأقل والعدد 1 على الأقل", False)
         return
     _save_config(work_duration_minutes=total_minutes, work_msg_threshold=threshold,
-                 work_emulators=ui["emulators"].get(), work_color_check=bool(ui["color_check"].get()))
+                 work_emulators=ui["emulators"].get(), work_color_check=bool(ui["color_check"].get()),
+                 work_strict_shape=bool(ui["strict_shape"].get()),
+                 work_show_plus=bool(ui["show_plus"].get()))
     _work_cfg_reload()
     ui["emulators"].set(_work_cfg["emulators_text"])
     _work_apply_duration()
@@ -6187,6 +6578,88 @@ def _work_pick_current_window():
     step(5)
 
 
+def _work_diagnose_start():
+    """'اختبار الكشف': after 5 s, look at the emulator window and report whether the send arrow is seen."""
+    ui = _work_ui
+    note = ui.get("note")
+    win = _work_win
+
+    def step(left):
+        try:
+            if win is None or not win.winfo_exists():
+                return
+            if left > 0:
+                note.config(text=f"افتح الشات وخلّي المحاكي قدّام... {left}", fg="#b06a00")
+                win.after(1000, lambda: step(left - 1))
+                return
+            note.config(text="بفحص الشاشة...", fg="#b06a00")
+            threading.Thread(target=_work_diagnose_run, daemon=True).start()
+        except tk.TclError:
+            pass
+
+    step(5)
+
+
+def _work_diagnose_run():
+    """Worker thread: run both detectors on the emulator window; save work_debug.png + work_debug.txt."""
+    def say(text, good):
+        def apply():
+            try:
+                note = _work_ui.get("note")
+                if note is not None:
+                    note.config(text=text, fg="#1b8a3a" if good else "#b3261e")
+            except tk.TclError:
+                pass
+        _ui_call(apply)
+
+    try:
+        rect = _work_foreground_emulator_rect()
+        if rect is None:
+            say("المحاكي مش قدّام (أو مش في قايمة البرامج)", False)
+            return
+        width, height = rect.right - rect.left, rect.bottom - rect.top
+        strict = _work_find_send_button(rect)
+        loose = _work_green_blob_in_window(rect)
+
+        # What the detector looked at, for the report and the picture.
+        x0 = rect.left + int(width * _WORK_ENTER_SCAN_X[0])
+        y0 = rect.top + int(height * _WORK_ENTER_SCAN_Y[0])
+        w = min(rect.left + int(width * _WORK_ENTER_SCAN_X[1]) - x0, 1600)
+        h = min(rect.top + int(height * _WORK_ENTER_SCAN_Y[1]) - y0, 1200)
+        lines = [f"window {width}x{height} at ({rect.left},{rect.top}); scan region {w}x{h} at ({x0},{y0})",
+                 f"strict shape check : {strict}", f"old color-only check: {loose}", ""]
+        data = _work_grab(x0, y0, w, h)
+        if data:
+            step_size = _work_scan_step(w, h)
+            for blob in sorted(_work_green_blobs(data, w, h, step_size, step_size), key=lambda b: -b["n"])[:15]:
+                kind, why = _work_blob_verdict(blob, data, w, width)
+                lines.append(f"green blob {blob['x1'] - blob['x0']}x{blob['y1'] - blob['y0']} at "
+                             f"({x0 + blob['x0']},{y0 + blob['y0']}) samples={blob['n']}: "
+                             f"{kind.upper() if kind else 'rejected'} - {why}")
+        shot = _work_grab(rect.left, rect.top, min(width, 1600), min(height, 1200))
+        if shot:
+            picture = Image.frombuffer("RGBA", (min(width, 1600), min(height, 1200)), shot, "raw", "BGRA", 0, 1).convert("RGB")
+            draw = ImageDraw.Draw(picture)
+            draw.rectangle([x0 - rect.left, y0 - rect.top, x0 - rect.left + w, y0 - rect.top + h], outline=(0, 120, 255), width=2)
+            if strict:
+                cx, cy = strict[1] - rect.left, strict[2] - rect.top
+                draw.ellipse([cx - 22, cy - 22, cx + 22, cy + 22], outline=(255, 0, 0), width=3)
+            picture.save(os.path.join(CONFIG_DIR, "work_debug.png"))
+        with open(os.path.join(CONFIG_DIR, "work_debug.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        if strict:
+            say("لقيت سهم الإرسال ✓ " + ("(الشريط مفتوح)" if strict[0] == "cap" else "(ظاهر كامل)"), True)
+            return
+        say("مفيش سهم إرسال ظاهر ✗ - اتحفظت صورة التشخيص" if not loose else
+            "لون أخضر من غير شكل سهم ✗ (مش هيتعد) - اتحفظت صورة التشخيص", False)
+        if _IS_WINDOWS:
+            os.startfile(CONFIG_DIR)       # opens the folder that holds work_debug.png / work_debug.txt
+    except Exception as e:
+        say("حصل خطأ في الفحص", False)
+        safe_print(f"[WARNING] Work counter diagnose failed: {e}")
+
+
 def _work_close_window():
     global _work_win
     _work_save(force=True)
@@ -6202,6 +6675,8 @@ def _work_close_window():
 def _work_open_window():
     """Build and show the 'يلا نشتغل' window. Tk main thread only. A second call focuses the same window."""
     global _work_win
+    if _work_mini_win is not None:
+        _work_mini_hide(restore=False)       # the big window is coming back: drop the small box
     try:
         if _work_win is not None and _work_win.winfo_exists():
             _work_win.deiconify()
@@ -6217,13 +6692,20 @@ def _work_open_window():
         win.title("يلا نشتغل")
         win.resizable(False, True)
         x = (win.winfo_screenwidth() - 440) // 2
-        y = max(20, (win.winfo_screenheight() - 700) // 2)
-        win.geometry(f"440x700+{x}+{y}")
-        win.minsize(440, 560)
+        y = max(10, (win.winfo_screenheight() - 800) // 2)
+        win.geometry(f"440x800+{x}+{y}")
+        win.minsize(440, 660)
+
+        # ---- top bar: "تصغير" = only the time + count in a small box you can move anywhere ----
+        topbar = tk.Frame(win)
+        topbar.pack(fill="x", padx=12, pady=(8, 0))
+        mini_button = tk.Button(topbar, text="—  تصغير", command=_work_mini_show)
+        _style_button(mini_button, "neutral", font=("Segoe UI", 9, "bold"))
+        mini_button.pack(side="left", ipady=2)
 
         # ---- timer ----
         _work_ui["timer"] = tk.Label(win, text="00:00:00", font=("Consolas", 46, "bold"))
-        _work_ui["timer"].pack(pady=(18, 0))
+        _work_ui["timer"].pack(pady=(4, 0))
         _work_ui["status"] = tk.Label(win, text="", font=("Segoe UI", 12, "bold"), fg="gray")
         _work_ui["status"].pack(pady=(0, 10))
 
@@ -6282,6 +6764,15 @@ def _work_open_window():
         _work_ui["color_check"] = tk.BooleanVar(value=_work_cfg["color_check"])
         tk.Checkbutton(settings, text="تحقق من لون السهم الأخضر", variable=_work_ui["color_check"],
                        font=("Segoe UI", 10), anchor="e").pack(fill="x")
+        _work_ui["strict_shape"] = tk.BooleanVar(value=_work_cfg["strict_shape"])
+        tk.Checkbutton(settings, text="تدقيق شكل السهم (يمنع العدّ لما الشات مقفول)",
+                       variable=_work_ui["strict_shape"], font=("Segoe UI", 10), anchor="e").pack(fill="x")
+        _work_ui["show_plus"] = tk.BooleanVar(value=_work_cfg["show_plus"])
+        tk.Checkbutton(settings, text="إظهار الرقم (+100، +101...) عند كل رسالة بتتعد",
+                       variable=_work_ui["show_plus"], font=("Segoe UI", 10), anchor="e").pack(fill="x")
+        diagnose = tk.Button(settings, text="اختبار الكشف (افتح الشات الأول)", command=_work_diagnose_start)
+        _style_button(diagnose, "neutral", font=("Segoe UI", 9, "bold"))
+        diagnose.pack(fill="x", pady=2, ipady=3)
         save = tk.Button(settings, text="حفظ الإعدادات", command=_work_save_settings_from_window)
         _style_button(save, "primary", font=("Segoe UI", 10, "bold"))
         save.pack(fill="x", pady=(4, 2), ipady=4)
@@ -6324,6 +6815,7 @@ def _work_tick():
         if _work_dirty and time.monotonic() - _work_last_save >= WORK_SAVE_THROTTLE_SECONDS:
             _work_save(force=True)
         _work_refresh_window()
+        _work_refresh_mini()
     except Exception as e:
         safe_print(f"[WARNING] Work timer tick failed: {e}")
     finally:
