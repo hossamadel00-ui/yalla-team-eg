@@ -192,7 +192,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.16"
+APP_VERSION = "1.0.18"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -5309,7 +5309,24 @@ WORK_STATE_FILE_PATH = os.path.join(CONFIG_DIR, "work_timer.json")
 WORK_SESSIONS_FILE_PATH = os.path.join(CONFIG_DIR, "work_sessions.json")
 WORK_DEFAULT_DURATION_MINUTES = 6 * 60
 WORK_DEFAULT_THRESHOLD = 100
-WORK_DEFAULT_EMULATORS = "hd-player.exe"          # BlueStacks
+WORK_DEFAULT_EMULATORS = "hd-player.exe"          # BlueStacks / MSI App Player
+# Always recognised in addition to the user's list (so the counter works out of the box):
+WORK_KNOWN_EMULATOR_EXES = (
+    "hd-player.exe",            # BlueStacks and MSI App Player instance window
+    "msiappplayer.exe", "msi app player.exe",
+    "bluestacks.exe", "bluestacksx.exe",
+    "dnplayer.exe", "ldplayer.exe", "ldplayer9.exe",          # LDPlayer
+    "nox.exe", "noxplayer.exe",                               # Nox
+    "memu.exe",                                               # MEmu
+    "mumuplayer.exe", "mumunxmain.exe", "mumuvmmheadless.exe", "nemuplayer.exe",   # MuMu
+    "aow_exe.exe", "androidemulatorex.exe", "androidemulator.exe",   # Gameloop / Tencent
+)
+# If the program name is not in any list, a window title containing one of these also counts.
+# Users can add their own with a "title:" entry, e.g.  title:LB RAKAN
+WORK_TITLE_HINTS = ("msi app player", "bluestacks", "ldplayer", "mumu", "memu", "nox player", "gameloop")
+# Never treat these as the emulator itself (they are only managers/launchers).
+WORK_NOT_EMULATOR_EXES = ("hd-multiinstancemanager.exe", "hd-multiinstancemanagercontrol.exe",
+                          "hd-multiinstancemanager", "msiappplayermanager.exe")
 WORK_DOUBLE_SEND_SECONDS = 0.33                   # two sends this close = ONE message
 WORK_SAVE_THROTTLE_SECONDS = 1.0                  # counter writes: at most once per second
 WORK_TICK_MS = 250
@@ -5391,7 +5408,11 @@ def _work_cfg_reload():
             part = part.strip().lower()
             if not part:
                 continue
-            if not part.endswith(".exe"):
+            if part.startswith("title:"):
+                part = "title:" + part[6:].strip()
+                if len(part) <= 6:
+                    continue
+            elif not part.endswith(".exe"):
                 part += ".exe"
             if part not in names:
                 names.append(part)
@@ -6019,14 +6040,43 @@ def _work_cursor_pos():
     return None
 
 
+def _work_window_title(hwnd) -> str:
+    """Lowercase title of a window ('' if unknown)."""
+    try:
+        _w_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        _w_user32.GetWindowTextW.restype = ctypes.c_int
+        buf = ctypes.create_unicode_buffer(512)
+        _w_user32.GetWindowTextW(hwnd, buf, 512)
+        return buf.value.lower()
+    except Exception:
+        return ""
+
+
+def _work_is_emulator(name: str, title: str) -> bool:
+    """Is this program/window one of the emulators we should count messages in?"""
+    name = (name or "").lower()
+    title = (title or "").lower()
+    if name in WORK_NOT_EMULATOR_EXES:
+        return False
+    configured = _work_cfg["emulators"]
+    if name and (name in configured or name in WORK_KNOWN_EMULATOR_EXES):
+        return True
+    for entry in configured:                       # "title:xxx" entries typed by the user
+        if entry.startswith("title:") and entry[6:] and entry[6:] in title:
+            return True
+    return any(hint in title for hint in WORK_TITLE_HINTS)
+
+
 def _work_foreground_emulator_rect():
     """The foreground window's rectangle if it belongs to a configured emulator, else None."""
-    name = _get_foreground_process_name()
-    if not name or name not in _work_cfg["emulators"]:
-        return None
     hwnd = _w_user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    name = _get_foreground_process_name()
+    if not _work_is_emulator(name, _work_window_title(hwnd)):
+        return None
     rect = wintypes.RECT()
-    if not hwnd or not _w_user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+    if not _w_user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return None
     return rect
 
@@ -6564,6 +6614,9 @@ def _work_pick_current_window():
             if not name or name == own:
                 note.config(text="ماقدرتش أحدد النافذة - افتح المحاكي وجرب تاني", fg="#b3261e")
                 return
+            if name in WORK_NOT_EMULATOR_EXES:
+                note.config(text="ده مدير المحاكيات مش نافذة المحاكي نفسه - افتح شات اللعبة وجرب تاني", fg="#b3261e")
+                return
             current = [p.strip() for p in re.split(r"[,;،]", ui["emulators"].get()) if p.strip()]
             if name not in [p.lower() for p in current]:
                 current.append(name)
@@ -6615,7 +6668,10 @@ def _work_diagnose_run():
     try:
         rect = _work_foreground_emulator_rect()
         if rect is None:
-            say("المحاكي مش قدّام (أو مش في قايمة البرامج)", False)
+            seen_hwnd = _w_user32.GetForegroundWindow()
+            seen = _get_foreground_process_name() or "?"
+            seen_title = _work_window_title(seen_hwnd)[:30]
+            say(f"البرنامج شايف: {seen} | {seen_title} - مش في القايمة. اضغط \"اختار نافذة المحاكي الحالية\"", False)
             return
         width, height = rect.right - rect.left, rect.bottom - rect.top
         strict = _work_find_send_button(rect)
