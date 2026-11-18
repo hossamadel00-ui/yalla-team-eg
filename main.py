@@ -187,6 +187,18 @@ except ImportError:
 APP_NAME = "Yalla Team EG"
 
 # ---------------------------------------------------------------------
+# TWO PROGRAMS, ONE .exe. The same build runs either:
+#   * the translator (default, no arguments), or
+#   * the "يلا نشتغل" work timer + sent-messages counter ("--counter").
+# Each has its own shortcut/icon, its own tray icon, its own taskbar
+# button and its own single-instance lock, so they open and close
+# independently. The installer creates both shortcuts.
+# ---------------------------------------------------------------------
+APP_MODE = "counter" if "--counter" in sys.argv[1:] else "translator"
+COUNTER_APP_NAME = "يلا نشتغل"
+COUNTER_APP_USER_MODEL_ID = "YallaTeamEG.WorkCounter"   # must match the installer shortcut
+
+# ---------------------------------------------------------------------
 # Auto-update. APP_VERSION is THIS build's version: raise it by hand
 # every time you build a new Setup (e.g. "1.0.1"), and put the same
 # number in version.json on GitHub when you publish that build.
@@ -197,7 +209,7 @@ APP_NAME = "Yalla Team EG"
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.20"
+APP_VERSION = "1.0.21"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -5091,9 +5103,7 @@ def _build_main_window(root):
     more_button = tk.Button(_actions_row, text="⋯", width=4)
     _style_button(more_button, "neutral", font=("Segoe UI", 12, "bold"))
     more_button.grid(row=0, column=3, padx=(6, 0), ipady=3)
-    _work_button = tk.Button(_actions_row, text="⏱  يلا نشتغل", command=_work_open_window)
-    _style_button(_work_button, "accent")
-    _work_button.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0), ipady=6)
+    # ("يلا نشتغل" is a separate program now - its own shortcut/icon - so no button here.)
     more_menu = tk.Menu(root, tearoff=0)
     more_menu.add_command(label="Minimize to tray", command=_hide_to_tray)
     more_menu.add_command(label="Check for updates", command=_check_for_update_manual)
@@ -5377,6 +5387,18 @@ def _tray_is_dark(item):
 #     "تحقق من لون السهم الأخضر" (then every Enter / every click inside the
 #     emulator window counts).
 # =========================================================================
+def _work_problem(where: str, exc: Exception = None, counts_as_failure=False, **_ignored):
+    """Problems inside the counter program: log them and show a tray message
+    (the translator's 'Quick fix' panel does not exist in this program)."""
+    detail = f"{type(exc).__name__}: {exc}" if exc is not None else ""
+    safe_print(f"[ERROR] {where}: {detail}")
+    try:
+        _append_log_to_file("ERROR", where, detail, "")
+    except Exception:
+        pass
+    _notify(where, detail or "حصلت مشكلة")
+
+
 WORK_STATE_FILE_PATH = os.path.join(CONFIG_DIR, "work_timer.json")
 WORK_SESSIONS_FILE_PATH = os.path.join(CONFIG_DIR, "work_sessions.json")
 WORK_DEFAULT_DURATION_MINUTES = 6 * 60
@@ -5418,6 +5440,16 @@ _WORK_ENTER_BAND_X = 0.70          # band = right 30% of the window...
 _WORK_ENTER_BAND_Y = 0.86          # ...and the bottom 14%
 _WORK_ENTER_BAND_STEP_X = 2
 _WORK_ENTER_BAND_MIN_GREEN = 8
+# The Arabic version of the game is MIRRORED: the send arrow sits bottom-LEFT and the input
+# box is to its right. Every region above is written for the right side; for the left side
+# the same fractions are mirrored (0.55..1.0 -> 0.0..0.45), so both versions are counted.
+_WORK_SIDES = ("right", "left")
+# A real send arrow always has the chat INPUT BOX right next to it (a wide light bar on the
+# same line, on its left in the English game, on its right in the Arabic one). Green buttons
+# in quests/tasks do not. While the phone keyboard's typing bar is open only the arrow's top
+# edge shows, and that wide white bar is directly under it.
+_WORK_BAR_MIN_LIGHT = 0.50         # at least half of the strip beside the arrow must be light
+_WORK_TYPING_BAR_MIN_LIGHT = 0.60  # ...and 60% of the row under a "cap" (the typing bar)
 
 _work_lock = threading.RLock()        # guards _work (the worker thread changes 'count')
 _work_file_lock = threading.Lock()    # serializes the atomic file writes
@@ -5426,7 +5458,10 @@ _work_stop_event = threading.Event()
 _work_active = False                  # hooks/worker running (the key hook checks this)
 _work_shutting_down = False
 _work_last_counted = -10.0            # monotonic time of the last counted send
+_work_last_typed = -10.0              # monotonic time of the last typed/pasted key...
+_work_last_typed_hwnd = 0             # ...and the window that was in front when it was typed
 _work_dirty = False
+_work_loaded = False                  # work_timer.json was read (only the counter program does that)
 _work_last_save = 0.0
 _work_write_failed_logged = False
 _work_win = None
@@ -5441,7 +5476,8 @@ _work_mini_win = None                 # the small movable time + count box ("ت�
 _work_mini_ui = {}
 _work_cfg = {"minutes": WORK_DEFAULT_DURATION_MINUTES, "threshold": WORK_DEFAULT_THRESHOLD,
              "emulators": [WORK_DEFAULT_EMULATORS], "emulators_text": WORK_DEFAULT_EMULATORS,
-             "color_check": True, "strict_shape": True, "show_plus": True}
+             "color_check": True, "strict_shape": True, "show_plus": True,
+             "need_typing": True, "need_input_bar": True}
 
 
 def _work_default_state(duration_seconds: float) -> dict:
@@ -5496,6 +5532,8 @@ def _work_cfg_reload():
             "color_check": bool(cfg.get("work_color_check", True)),
             "strict_shape": bool(cfg.get("work_strict_shape", True)),
             "show_plus": bool(cfg.get("work_show_plus", True)),
+            "need_typing": bool(cfg.get("work_need_typing", True)),
+            "need_input_bar": bool(cfg.get("work_need_input_bar", True)),
         })
     except Exception as e:
         safe_print(f"[WARNING] Could not read the work-timer settings: {e}")
@@ -5556,6 +5594,8 @@ def _work_save(force: bool = False):
     makes the 250 ms tick write the rest) so rapid sending never blocks.
     """
     global _work_dirty, _work_last_save
+    if not _work_loaded:
+        return      # never loaded (e.g. the translator process): never overwrite the saved timer
     now = time.monotonic()
     if not force and now - _work_last_save < WORK_SAVE_THROTTLE_SECONDS:
         _work_dirty = True
@@ -5683,7 +5723,7 @@ def _work_confirm_reset():
                 parent=_work_win):
             _work_do_reset()
     except Exception as e:
-        _report_problem("Work timer reset", exc=e, counts_as_failure=False)
+        _work_problem("Work timer reset", exc=e, counts_as_failure=False)
 
 
 def _work_adjust_count(delta: int):
@@ -5696,6 +5736,7 @@ def _work_adjust_count(delta: int):
 
 def _work_load_state():
     """Read work_timer.json at startup. Time kept running while the program was closed."""
+    global _work_loaded
     _work_cfg_reload()
     data = _work_read_json(WORK_STATE_FILE_PATH, {})
     if not isinstance(data, dict):
@@ -5737,6 +5778,7 @@ def _work_load_state():
     with _work_lock:
         _work.clear()
         _work.update(state)
+    _work_loaded = True
     _work_check_finish()      # finished while the program was closed -> the tick shows the alert
 
 
@@ -5768,6 +5810,53 @@ def _work_note_enter():
         _work_events.put_nowait(("enter", time.monotonic()))
     except queue.Full:
         pass
+
+
+# Keys that do NOT put text in the chat box (everything else counts as "typing").
+_WORK_NON_TYPING_KEYS = {
+    "enter", "esc", "escape", "tab", "up", "down", "left", "right", "home", "end",
+    "page up", "page down", "insert", "caps lock", "num lock", "scroll lock",
+    "print screen", "pause", "menu", "apps", "windows", "left windows", "right windows",
+    "volume up", "volume down", "volume mute", "play/pause media", "next track", "previous track",
+}
+
+
+def _work_note_typing():
+    """A key that writes text (a letter, a digit, space, backspace, Ctrl+V...) was pressed.
+    Only remembers WHEN and in WHICH window - cheap enough for the keyboard hook."""
+    global _work_last_typed, _work_last_typed_hwnd
+    try:
+        _work_last_typed_hwnd = int(_w_user32.GetForegroundWindow() or 0)
+    except Exception:
+        _work_last_typed_hwnd = 0
+    _work_last_typed = time.monotonic()
+
+
+def _work_key_event(event):
+    """Keyboard hook of the counter program: Enter may be a send; other keys = typing."""
+    try:
+        if event.event_type != "down":
+            return
+        name = (event.name or "").lower()
+        if name == "enter":
+            _work_note_enter()
+            return
+        if (not name or name in MODIFIER_KEYS or name in _WORK_NON_TYPING_KEYS
+                or re.fullmatch(r"f\d{1,2}", name)):
+            return
+        _work_note_typing()
+    except Exception:
+        pass
+
+
+def _work_typed_before(stamp: float, hwnd) -> bool:
+    """Was something typed/pasted in THIS window after the last counted message (and before 'stamp')?
+    Clicking green buttons in quests/tasks involves no typing, so it is not counted."""
+    typed_at, typed_hwnd = _work_last_typed, _work_last_typed_hwnd
+    with _work_lock:
+        last_counted = _work_last_counted
+    return (typed_at > last_counted and typed_at <= stamp + 0.05
+            and (not typed_hwnd or not hwnd or int(typed_hwnd) == int(hwnd)))
 
 
 def _work_is_green(r: int, g: int, b: int) -> bool:
@@ -5885,12 +5974,13 @@ def _work_grab(x: int, y: int, w: int, h: int):
 
 
 def _work_count_green(data: bytes, w: int, h: int, step: int, stop_at: int,
-                      x_from: int = 0, y_from: int = 0, step_y: int = None) -> int:
+                      x_from: int = 0, y_from: int = 0, step_y: int = None, x_to: int = None) -> int:
     """Count green samples on a grid (stops early once 'stop_at' is reached)."""
     found = 0
+    x_to = w if x_to is None else min(w, x_to)
     for row in range(y_from, h, step_y or step):
         base = row * w * 4
-        for col in range(x_from, w, step):
+        for col in range(x_from, x_to, step):
             i = base + col * 4
             b, g, r = data[i], data[i + 1], data[i + 2]
             if g > r and g > b and _work_is_green(r, g, b):
@@ -5909,27 +5999,51 @@ def _work_click_is_send_button(x: int, y: int) -> bool:
     return _work_count_green(data, side, side, _WORK_CLICK_STEP, _WORK_CLICK_MIN_GREEN) >= _WORK_CLICK_MIN_GREEN
 
 
+def _work_side_span(width: int, side: str, frac_from: float, frac_to: float = 1.0) -> tuple:
+    """(x_from, x_to) inside the window for a right-side fraction range, mirrored for side='left'."""
+    if side == "left":
+        return int(width * (1.0 - frac_to)), int(width * (1.0 - frac_from))
+    return int(width * frac_from), int(width * frac_to)
+
+
+def _work_scan_region(rect, side: str) -> tuple:
+    """Screen box (x0, y0, w, h) the Enter check looks at, on the given side of the window."""
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    sx0, sx1 = _work_side_span(width, side, _WORK_ENTER_SCAN_X[0], _WORK_ENTER_SCAN_X[1])
+    x0 = rect.left + sx0
+    y0 = rect.top + int(height * _WORK_ENTER_SCAN_Y[0])
+    y1 = rect.top + int(height * _WORK_ENTER_SCAN_Y[1])
+    return x0, y0, min(sx1 - sx0, 1600), min(y1 - y0, 1200)
+
+
+def _work_band_span(rect, side: str, x0: int, w: int) -> tuple:
+    """(x_from, x_to) of the bottom-corner band inside a scan-region buffer."""
+    width = rect.right - rect.left
+    bx0, bx1 = _work_side_span(width, side, _WORK_ENTER_BAND_X, 1.0)
+    off = x0 - rect.left
+    return max(0, bx0 - off), max(0, min(w, bx1 - off))
+
+
 def _work_green_blob_in_window(rect) -> bool:
-    """Is a green send-button-like blob visible in the lower-right of the emulator window?"""
+    """Old (color-only) rule: is a green send-button-like blob visible in a bottom corner of the window?"""
     width, height = rect.right - rect.left, rect.bottom - rect.top
     if width < 120 or height < 120:
         return False
-    x0 = rect.left + int(width * _WORK_ENTER_SCAN_X[0])
-    x1 = rect.left + int(width * _WORK_ENTER_SCAN_X[1])
-    y0 = rect.top + int(height * _WORK_ENTER_SCAN_Y[0])
-    y1 = rect.top + int(height * _WORK_ENTER_SCAN_Y[1])
-    w, h = min(x1 - x0, 1600), min(y1 - y0, 1200)
-    data = _work_grab(x0, y0, w, h)
-    if not data:
-        return False
-    if _work_count_green(data, w, h, _WORK_ENTER_STEP, _WORK_ENTER_MIN_GREEN) >= _WORK_ENTER_MIN_GREEN:
-        return True      # the whole green arrow is visible
-    # Typing bar open: only the top edge of the arrow shows. Fine scan of the bottom-right band
-    # (the same screen grab, so no extra capture).
-    band_x = max(0, int(width * _WORK_ENTER_BAND_X) - (x0 - rect.left))
-    band_y = max(0, int(height * _WORK_ENTER_BAND_Y) - (y0 - rect.top))
-    return _work_count_green(data, w, h, _WORK_ENTER_BAND_STEP_X, _WORK_ENTER_BAND_MIN_GREEN,
-                             x_from=band_x, y_from=band_y, step_y=1) >= _WORK_ENTER_BAND_MIN_GREEN
+    for side in _WORK_SIDES:
+        x0, y0, w, h = _work_scan_region(rect, side)
+        data = _work_grab(x0, y0, w, h)
+        if not data:
+            continue
+        if _work_count_green(data, w, h, _WORK_ENTER_STEP, _WORK_ENTER_MIN_GREEN) >= _WORK_ENTER_MIN_GREEN:
+            return True      # the whole green arrow is visible
+        # Typing bar open: only the top edge of the arrow shows. Fine scan of the bottom band.
+        band_from, band_to = _work_band_span(rect, side, x0, w)
+        band_y = max(0, int(height * _WORK_ENTER_BAND_Y) - (y0 - rect.top))
+        if _work_count_green(data, w, h, _WORK_ENTER_BAND_STEP_X, _WORK_ENTER_BAND_MIN_GREEN,
+                             x_from=band_from, y_from=band_y, step_y=1,
+                             x_to=band_to) >= _WORK_ENTER_BAND_MIN_GREEN:
+            return True
+    return False
 
 
 # ---- SHAPE detection of the send arrow (pure functions: they only read a pixel buffer) ----
@@ -5943,13 +6057,14 @@ def _work_green_blob_in_window(rect) -> bool:
 # Anything else (rectangles, bars, scattered text, tiny emoji) is rejected.
 # BEGIN-SHAPE-DETECTION
 def _work_green_blobs(data: bytes, w: int, h: int, step_x: int, step_y: int,
-                      x_from: int = 0, y_from: int = 0, max_blobs: int = 80) -> list:
+                      x_from: int = 0, y_from: int = 0, max_blobs: int = 80, x_to: int = None) -> list:
     """
     Group the green samples of a grid into connected blobs (8 neighbours). Each blob is a dict:
     pixel box x0,y0,x1,y1 (inside the buffer), n = samples, cw/ch = box size in samples,
     rows = how many samples each row of the box has (top to bottom).
     """
-    gw = (w - x_from + step_x - 1) // step_x
+    x_end = w if x_to is None else max(x_from, min(w, x_to))
+    gw = (x_end - x_from + step_x - 1) // step_x
     gh = (h - y_from + step_y - 1) // step_y
     if gw <= 0 or gh <= 0:
         return []
@@ -6040,14 +6155,15 @@ def _work_blob_verdict(blob: dict, data: bytes, w: int, window_w: int) -> tuple:
 
 
 def _work_best_blob(data: bytes, w: int, h: int, window_w: int, step_x: int, step_y: int,
-                    x_from: int, y_from: int, origin_x: int, origin_y: int):
-    """Scan a grid; return (kind, screen_x, screen_y) of the best send-arrow blob, or None."""
+                    x_from: int, y_from: int, origin_x: int, origin_y: int, x_to: int = None):
+    """Scan a grid; return (kind, screen_x, screen_y, blob_w, blob_h) of the best send-arrow blob, or None."""
     best = None
-    for blob in _work_green_blobs(data, w, h, step_x, step_y, x_from, y_from):
+    for blob in _work_green_blobs(data, w, h, step_x, step_y, x_from, y_from, x_to=x_to):
         kind, _why = _work_blob_verdict(blob, data, w, window_w)
         if not kind:
             continue
-        found = (kind, origin_x + (blob["x0"] + blob["x1"]) // 2, origin_y + (blob["y0"] + blob["y1"]) // 2)
+        found = (kind, origin_x + (blob["x0"] + blob["x1"]) // 2, origin_y + (blob["y0"] + blob["y1"]) // 2,
+                 blob["x1"] - blob["x0"], blob["y1"] - blob["y0"])
         if kind == "circle":
             return found
         best = best or found
@@ -6059,16 +6175,13 @@ def _work_scan_step(w: int, h: int) -> int:
     return max(2, min(5, int(math.sqrt(max(1, w * h) / 25000.0))))
 
 
-def _work_find_send_button(rect):
-    """Strict Enter check. (kind, screen_x, screen_y) of the send arrow in the emulator window, or None."""
-    width, height = rect.right - rect.left, rect.bottom - rect.top
-    if width < 120 or height < 120:
+def _work_find_send_button_side(rect, side: str):
+    """Strict Enter check on ONE side. (kind, x, y, blob_w, blob_h) or None."""
+    height = rect.bottom - rect.top
+    width = rect.right - rect.left
+    x0, y0, w, h = _work_scan_region(rect, side)
+    if w <= 0 or h <= 0:
         return None
-    x0 = rect.left + int(width * _WORK_ENTER_SCAN_X[0])
-    x1 = rect.left + int(width * _WORK_ENTER_SCAN_X[1])
-    y0 = rect.top + int(height * _WORK_ENTER_SCAN_Y[0])
-    y1 = rect.top + int(height * _WORK_ENTER_SCAN_Y[1])
-    w, h = min(x1 - x0, 1600), min(y1 - y0, 1200)
     data = _work_grab(x0, y0, w, h)
     if not data:
         return None
@@ -6076,17 +6189,80 @@ def _work_find_send_button(rect):
     found = _work_best_blob(data, w, h, width, step, step, 0, 0, x0, y0)
     if found:
         return found
-    # Typing bar open: only the button's top edge shows. Fine scan of the bottom-right band
+    # Typing bar open: only the button's top edge shows. Fine scan of the bottom band
     # (rows one by one, because that edge is only ~4 px tall).
-    band_x = max(0, int(width * _WORK_ENTER_BAND_X) - (x0 - rect.left))
+    band_from, band_to = _work_band_span(rect, side, x0, w)
     band_y = max(0, int(height * _WORK_ENTER_BAND_Y) - (y0 - rect.top))
-    return _work_best_blob(data, w, h, width, 2, 1, band_x, band_y, x0, y0)
+    return _work_best_blob(data, w, h, width, 2, 1, band_from, band_y, x0, y0, x_to=band_to)
+
+
+def _work_is_light(r: int, g: int, b: int) -> bool:
+    """White / very light grey (the chat input box, the phone keyboard's typing bar)."""
+    return min(r, g, b) >= 200 and max(r, g, b) - min(r, g, b) <= 45
+
+
+def _work_light_fraction(data: bytes, w: int, row: int, x_from: int, x_to: int, step: int = 2) -> float:
+    """Fraction of light pixels in one row of a buffer, between x_from and x_to."""
+    x_from, x_to = max(0, x_from), min(w, x_to)
+    total = light = 0
+    base = row * w * 4
+    for x in range(x_from, x_to, step):
+        i = base + x * 4
+        total += 1
+        if _work_is_light(data[i + 2], data[i + 1], data[i]):
+            light += 1
+    return light / float(total) if total else 0.0
+
+
+def _work_input_bar_beside(rect, found) -> tuple:
+    """(ok, why). Is the chat input box next to this arrow (or the typing bar under its top edge)?"""
+    kind, cx, cy, bw, bh = found
+    width = rect.right - rect.left
+    if kind == "cap":
+        y = cy + max(2, bh // 2) + 6                     # a few pixels under the visible top edge
+        data = _work_grab(rect.left, y, width, 1)
+        if not data:
+            return False, "could not read the screen"
+        frac = _work_light_fraction(data, width, 0, 0, width)
+        return frac >= _WORK_TYPING_BAR_MIN_LIGHT, f"typing bar under the edge: {frac:.0%} light"
+    d = max(bw, bh)
+    data = _work_grab(rect.left, cy - 3, width, 7)
+    if not data:
+        return False, "could not read the screen"
+    local_cx = cx - rect.left
+    length = max(int(d * 2.5), int(width * 0.22))
+    best = 0.0
+    for direction in (1, -1):                            # right of the arrow (Arabic), left of it (English)
+        start = local_cx + direction * (d // 2 + max(4, d // 4))
+        a, b = (start, start + length) if direction > 0 else (start - length, start)
+        a, b = max(0, a), min(width, b)
+        if b - a < d:
+            continue
+        frac = sum(_work_light_fraction(data, width, row, a, b) for row in (1, 3, 5)) / 3.0
+        best = max(best, frac)
+    return best >= _WORK_BAR_MIN_LIGHT, f"input box beside the arrow: {best:.0%} light"
+
+
+def _work_find_send_button(rect):
+    """Strict Enter check. (kind, x, y, blob_w, blob_h) of the send arrow (either bottom corner), or None.
+    With "need_input_bar" on, an arrow without the chat input box beside it is ignored."""
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width < 120 or height < 120:
+        return None
+    for side in _WORK_SIDES:
+        found = _work_find_send_button_side(rect, side)
+        if found is None:
+            continue
+        if _work_cfg.get("need_input_bar", True) and not _work_input_bar_beside(rect, found)[0]:
+            continue
+        return found
+    return None
 
 
 def _work_click_hits_send_button(rect, x: int, y: int) -> bool:
-    """Strict click check: is the click ON a send-arrow shaped blob (and in the lower-right zone)?"""
+    """Strict click check: is the click ON a send-arrow shaped blob, low in the window (either side)?"""
     width, height = rect.right - rect.left, rect.bottom - rect.top
-    if x < rect.left + width * 0.45 or y < rect.top + height * 0.30 or x > rect.right or y > rect.bottom:
+    if x < rect.left or y < rect.top + height * 0.30 or x > rect.right or y > rect.bottom:
         return False
     radius = 56
     side = 2 * radius + 1
@@ -6095,8 +6271,16 @@ def _work_click_hits_send_button(rect, x: int, y: int) -> bool:
         return False
     for blob in _work_green_blobs(data, side, side, 2, 2):
         if blob["x0"] - 4 <= radius <= blob["x1"] + 4 and blob["y0"] - 4 <= radius <= blob["y1"] + 4:
-            if _work_blob_verdict(blob, data, side, width)[0]:
-                return True
+            kind = _work_blob_verdict(blob, data, side, width)[0]
+            if not kind:
+                continue
+            if _work_cfg.get("need_input_bar", True):
+                found = (kind, x - radius + (blob["x0"] + blob["x1"]) // 2,
+                         y - radius + (blob["y0"] + blob["y1"]) // 2,
+                         blob["x1"] - blob["x0"], blob["y1"] - blob["y0"])
+                if not _work_input_bar_beside(rect, found)[0]:
+                    continue
+            return True
     return False
 # END-SHAPE-DETECTION
 
@@ -6139,18 +6323,23 @@ def _work_is_emulator(name: str, title: str) -> bool:
     return any(hint in title for hint in WORK_TITLE_HINTS)
 
 
-def _work_foreground_emulator_rect():
-    """The foreground window's rectangle if it belongs to a configured emulator, else None."""
+def _work_foreground_emulator():
+    """(hwnd, rect) of the foreground window if it belongs to a configured emulator, else (None, None)."""
     hwnd = _w_user32.GetForegroundWindow()
     if not hwnd:
-        return None
+        return None, None
     name = _get_foreground_process_name()
     if not _work_is_emulator(name, _work_window_title(hwnd)):
-        return None
+        return None, None
     rect = wintypes.RECT()
     if not _w_user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return None
-    return rect
+        return None, None
+    return hwnd, rect
+
+
+def _work_foreground_emulator_rect():
+    """The foreground window's rectangle if it belongs to a configured emulator, else None."""
+    return _work_foreground_emulator()[1]
 
 
 def _work_handle_event(event):
@@ -6158,9 +6347,11 @@ def _work_handle_event(event):
     kind, stamp = event[0], event[-1]
     if time.monotonic() - stamp > 2.0:
         return                                  # stale (the worker was starved): ignore
-    rect = _work_foreground_emulator_rect()
+    hwnd, rect = _work_foreground_emulator()
     if rect is None:
         return                                  # emulator is not in front: no counting
+    if _work_cfg.get("need_typing", True) and not _work_typed_before(stamp, hwnd):
+        return                                  # nothing typed since the last message: a quest/task button
     check_color = _work_cfg["color_check"]
     strict = _work_cfg.get("strict_shape", True)
     pos = None                                  # where the little "+1" will appear
@@ -6171,7 +6362,7 @@ def _work_handle_event(event):
                 if found is None:
                     return
                 pos = (found[1], found[2])
-            elif not _work_green_blob_in_window(rect):   # old rule: any green in the corner
+            elif not _work_green_blob_in_window(rect):   # old rule: any green in a bottom corner
                 return
         pos = pos or _work_cursor_pos()
     elif kind == "click":
@@ -6345,7 +6536,7 @@ def _work_show_alert():
         _work_no_activate(win)     # shows on top but never grabs the keyboard focus
         threading.Thread(target=_work_play_alert_sound, daemon=True).start()
     except Exception as e:
-        _report_problem("Work timer alert", exc=e, counts_as_failure=False)
+        _work_problem("Work timer alert", exc=e, counts_as_failure=False)
 
 
 def _work_show_toast(text: str):
@@ -6540,7 +6731,7 @@ def _work_mini_show():
             _work_win.withdraw()
         _work_refresh_mini()
     except Exception as e:
-        _report_problem("Work timer mini box", exc=e, counts_as_failure=False)
+        _work_problem("Work timer mini box", exc=e, counts_as_failure=False)
         _work_mini_hide(True)
 
 
@@ -6659,7 +6850,9 @@ def _work_save_settings_from_window():
     _save_config(work_duration_minutes=total_minutes, work_msg_threshold=threshold,
                  work_emulators=ui["emulators"].get(), work_color_check=bool(ui["color_check"].get()),
                  work_strict_shape=bool(ui["strict_shape"].get()),
-                 work_show_plus=bool(ui["show_plus"].get()))
+                 work_show_plus=bool(ui["show_plus"].get()),
+                 work_need_typing=bool(ui["need_typing"].get()),
+                 work_need_input_bar=bool(ui["need_input_bar"].get()))
     _work_cfg_reload()
     ui["emulators"].set(_work_cfg["emulators_text"])
     _work_apply_duration()
@@ -6698,7 +6891,7 @@ def _work_pick_current_window():
         except tk.TclError:
             pass
         except Exception as e:
-            _report_problem("Work timer: pick window", exc=e, counts_as_failure=False)
+            _work_problem("Work timer: pick window", exc=e, counts_as_failure=False)
 
     step(5)
 
@@ -6726,7 +6919,8 @@ def _work_diagnose_start():
 
 
 def _work_diagnose_run():
-    """Worker thread: run both detectors on the emulator window; save work_debug.png + work_debug.txt."""
+    """Worker thread: run the detectors on BOTH bottom corners of the emulator window;
+    save work_debug.png + work_debug.txt."""
     def say(text, good):
         def apply():
             try:
@@ -6746,41 +6940,56 @@ def _work_diagnose_run():
             say(f"البرنامج شايف: {seen} | {seen_title} - مش في القايمة. اضغط \"اختار نافذة المحاكي الحالية\"", False)
             return
         width, height = rect.right - rect.left, rect.bottom - rect.top
-        strict = _work_find_send_button(rect)
         loose = _work_green_blob_in_window(rect)
-
-        # What the detector looked at, for the report and the picture.
-        x0 = rect.left + int(width * _WORK_ENTER_SCAN_X[0])
-        y0 = rect.top + int(height * _WORK_ENTER_SCAN_Y[0])
-        w = min(rect.left + int(width * _WORK_ENTER_SCAN_X[1]) - x0, 1600)
-        h = min(rect.top + int(height * _WORK_ENTER_SCAN_Y[1]) - y0, 1200)
-        lines = [f"window {width}x{height} at ({rect.left},{rect.top}); scan region {w}x{h} at ({x0},{y0})",
-                 f"strict shape check : {strict}", f"old color-only check: {loose}", ""]
-        data = _work_grab(x0, y0, w, h)
-        if data:
-            step_size = _work_scan_step(w, h)
-            for blob in sorted(_work_green_blobs(data, w, h, step_size, step_size), key=lambda b: -b["n"])[:15]:
-                kind, why = _work_blob_verdict(blob, data, w, width)
-                lines.append(f"green blob {blob['x1'] - blob['x0']}x{blob['y1'] - blob['y0']} at "
-                             f"({x0 + blob['x0']},{y0 + blob['y0']}) samples={blob['n']}: "
-                             f"{kind.upper() if kind else 'rejected'} - {why}")
+        lines = [f"window {width}x{height} at ({rect.left},{rect.top})",
+                 f"old color-only check (both corners): {loose}",
+                 f"need typing: {_work_cfg.get('need_typing', True)} | need input box: "
+                 f"{_work_cfg.get('need_input_bar', True)}", ""]
+        regions, arrow, arrow_bar, arrow_without_bar = [], None, "", None
+        for side in _WORK_SIDES:
+            x0, y0, w, h = _work_scan_region(rect, side)
+            regions.append((x0, y0, w, h))
+            found = _work_find_send_button_side(rect, side)
+            bar_ok, bar_why = _work_input_bar_beside(rect, found) if found else (False, "")
+            lines.append(f"[{side}] scan region {w}x{h} at ({x0},{y0}): arrow={found} {bar_why}")
+            if found and (bar_ok or not _work_cfg.get("need_input_bar", True)) and arrow is None:
+                arrow, arrow_bar = found, bar_why
+            elif found and arrow_without_bar is None:
+                arrow_without_bar = found
+            data = _work_grab(x0, y0, w, h) if w > 0 and h > 0 else None
+            if data:
+                step_size = _work_scan_step(w, h)
+                for blob in sorted(_work_green_blobs(data, w, h, step_size, step_size), key=lambda b: -b["n"])[:10]:
+                    kind, why = _work_blob_verdict(blob, data, w, width)
+                    lines.append(f"    green blob {blob['x1'] - blob['x0']}x{blob['y1'] - blob['y0']} at "
+                                 f"({x0 + blob['x0']},{y0 + blob['y0']}) samples={blob['n']}: "
+                                 f"{kind.upper() if kind else 'rejected'} - {why}")
+            lines.append("")
         shot = _work_grab(rect.left, rect.top, min(width, 1600), min(height, 1200))
         if shot:
             picture = Image.frombuffer("RGBA", (min(width, 1600), min(height, 1200)), shot, "raw", "BGRA", 0, 1).convert("RGB")
             draw = ImageDraw.Draw(picture)
-            draw.rectangle([x0 - rect.left, y0 - rect.top, x0 - rect.left + w, y0 - rect.top + h], outline=(0, 120, 255), width=2)
-            if strict:
-                cx, cy = strict[1] - rect.left, strict[2] - rect.top
-                draw.ellipse([cx - 22, cy - 22, cx + 22, cy + 22], outline=(255, 0, 0), width=3)
+            for x0, y0, w, h in regions:
+                draw.rectangle([x0 - rect.left, y0 - rect.top, x0 - rect.left + w, y0 - rect.top + h],
+                               outline=(0, 120, 255), width=2)
+            for item, color in ((arrow, (255, 0, 0)), (arrow_without_bar, (255, 160, 0))):
+                if item:
+                    cx, cy = item[1] - rect.left, item[2] - rect.top
+                    draw.ellipse([cx - 22, cy - 22, cx + 22, cy + 22], outline=color, width=3)
             picture.save(os.path.join(CONFIG_DIR, "work_debug.png"))
         with open(os.path.join(CONFIG_DIR, "work_debug.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
 
-        if strict:
-            say("لقيت سهم الإرسال ✓ " + ("(الشريط مفتوح)" if strict[0] == "cap" else "(ظاهر كامل)"), True)
+        if arrow:
+            where = "على الشمال - نسخة عربي" if arrow[1] < rect.left + width / 2 else "على اليمين"
+            state = "الشريط مفتوح" if arrow[0] == "cap" else "ظاهر كامل"
+            say(f"لقيت سهم الإرسال ✓ ({where}، {state})", True)
             return
-        say("مفيش سهم إرسال ظاهر ✗ - اتحفظت صورة التشخيص" if not loose else
-            "لون أخضر من غير شكل سهم ✗ (مش هيتعد) - اتحفظت صورة التشخيص", False)
+        if arrow_without_bar:
+            say("لقيت سهم بس مفيش خانة كتابة جنبه ✗ - اتحفظت صورة التشخيص", False)
+        else:
+            say("مفيش سهم إرسال ظاهر ✗ - اتحفظت صورة التشخيص" if not loose else
+                "لون أخضر من غير شكل سهم ✗ (مش هيتعد) - اتحفظت صورة التشخيص", False)
         if _IS_WINDOWS:
             os.startfile(CONFIG_DIR)       # opens the folder that holds work_debug.png / work_debug.txt
     except Exception as e:
@@ -6788,9 +6997,25 @@ def _work_diagnose_run():
         safe_print(f"[WARNING] Work counter diagnose failed: {e}")
 
 
+_work_hide_hint_shown = False
+
+
 def _work_close_window():
-    global _work_win
+    """The window's X. In the counter program the window only HIDES (next to the clock) and the
+    counting goes on; 'خروج' / the tray's 'خروج' quits for real."""
+    global _work_win, _work_hide_hint_shown
     _work_save(force=True)
+    if APP_MODE == "counter":
+        try:
+            if _work_win is not None and _work_win.winfo_exists():
+                _work_win.withdraw()
+        except tk.TclError:
+            pass
+        if not _work_hide_hint_shown:
+            _work_hide_hint_shown = True
+            _notify(COUNTER_APP_NAME, "العدّاد لسه شغال جنب الساعة - دوس على أيقونة الساعة عشان ترجّعه. "
+                                      "عشان تقفله خالص: كليك يمين > خروج.")
+        return
     try:
         if _work_win is not None:
             _work_win.destroy()
@@ -6817,7 +7042,7 @@ def _work_open_window():
         win = tk.Toplevel(_root)
         _work_win = win
         _work_ui.clear()
-        win.title("يلا نشتغل")
+        win.title(f"{COUNTER_APP_NAME}  v{APP_VERSION}")
         win.resizable(False, True)
         x = (win.winfo_screenwidth() - 440) // 2
         y = max(10, (win.winfo_screenheight() - 800) // 2)
@@ -6830,6 +7055,10 @@ def _work_open_window():
         mini_button = tk.Button(topbar, text="—  تصغير", command=_work_mini_show)
         _style_button(mini_button, "neutral", font=("Segoe UI", 9, "bold"))
         mini_button.pack(side="left", ipady=2)
+        if APP_MODE == "counter":
+            exit_button = tk.Button(topbar, text="خروج", command=_counter_confirm_exit)
+            _style_button(exit_button, "stop", font=("Segoe UI", 9, "bold"))
+            exit_button.pack(side="right", ipady=2)
 
         # ---- timer ----
         _work_ui["timer"] = tk.Label(win, text="00:00:00", font=("Consolas", 46, "bold"))
@@ -6895,6 +7124,12 @@ def _work_open_window():
         _work_ui["strict_shape"] = tk.BooleanVar(value=_work_cfg["strict_shape"])
         tk.Checkbutton(settings, text="تدقيق شكل السهم (يمنع العدّ لما الشات مقفول)",
                        variable=_work_ui["strict_shape"], font=("Segoe UI", 10), anchor="e").pack(fill="x")
+        _work_ui["need_typing"] = tk.BooleanVar(value=_work_cfg["need_typing"])
+        tk.Checkbutton(settings, text="متعدّش غير لو كتبت حاجة (يمنع عدّ زراير المهام الخضرا)",
+                       variable=_work_ui["need_typing"], font=("Segoe UI", 10), anchor="e").pack(fill="x")
+        _work_ui["need_input_bar"] = tk.BooleanVar(value=_work_cfg["need_input_bar"])
+        tk.Checkbutton(settings, text="لازم خانة الكتابة تكون جنب السهم",
+                       variable=_work_ui["need_input_bar"], font=("Segoe UI", 10), anchor="e").pack(fill="x")
         _work_ui["show_plus"] = tk.BooleanVar(value=_work_cfg["show_plus"])
         tk.Checkbutton(settings, text="إظهار الرقم (+100، +101...) عند كل رسالة بتتعد",
                        variable=_work_ui["show_plus"], font=("Segoe UI", 10), anchor="e").pack(fill="x")
@@ -6928,7 +7163,7 @@ def _work_open_window():
         win.lift()
         win.focus_force()
     except Exception as e:
-        _report_problem("Work timer window", exc=e, counts_as_failure=False)
+        _work_problem("Work timer window", exc=e, counts_as_failure=False)
 
 
 # -------------------------------------------------------------------- tick
@@ -6961,7 +7196,7 @@ def _work_start_feature():
         _work_start_background()
         _root.after(WORK_TICK_MS, _work_tick)
     except Exception as e:
-        _report_problem("Work timer start", exc=e, counts_as_failure=False)
+        _work_problem("Work timer start", exc=e, counts_as_failure=False)
 
 
 def _tray_open_work(icon, item):
@@ -6982,7 +7217,6 @@ def _build_tray_icon():
         pystray.MenuItem("Dark mode", _tray_toggle_theme, checked=_tray_is_dark),
         pystray.MenuItem("Auto EN -> AR popup (on copy)", _tray_toggle_popup_auto_mode, checked=_tray_is_popup_auto_mode),
         pystray.MenuItem("Start with Windows", _tray_toggle_startup, checked=_tray_is_startup_enabled),
-        pystray.MenuItem("يلا نشتغل", _tray_open_work),
         pystray.MenuItem("Settings...", _tray_open_settings),
         pystray.MenuItem("Check for updates", lambda icon, item: _check_for_update_manual()),
         pystray.MenuItem("Exit", _tray_exit),
@@ -7346,6 +7580,8 @@ def _launch_silent_installer(setup_path: str):
     cmd = f'ping -n 4 127.0.0.1 >nul & start /wait "" "{setup_path}" {flags}'
     if getattr(sys, "frozen", False):  # built exe: start the program again afterwards
         cmd += f' & start "" "{sys.executable}"'
+        if _counter_is_running():       # Setup closes BOTH programs (same .exe): reopen the counter too
+            cmd += f' & start "" "{sys.executable}" --counter'
     DETACHED_PROCESS = 0x00000008
     CREATE_NEW_PROCESS_GROUP = 0x00000200
     CREATE_NO_WINDOW = 0x08000000
@@ -7536,8 +7772,16 @@ def _fatal_error_dialog(message: str):
 # =========================================================================
 # SINGLE INSTANCE (only one copy of the program may run at a time)
 # =========================================================================
-_SINGLE_INSTANCE_MUTEX_NAME = "Local\\YallaTeamEG_SingleInstance_Mutex"
-_SINGLE_INSTANCE_EVENT_NAME = "Local\\YallaTeamEG_SingleInstance_ShowEvent"
+# The translator keeps its old lock names; the counter program has its own, so the two can
+# run side by side (and each one alone is still limited to ONE copy).
+_COUNTER_MUTEX_NAME = "Local\\YallaTeamEG_WorkCounter_SingleInstance_Mutex"
+_COUNTER_EVENT_NAME = "Local\\YallaTeamEG_WorkCounter_SingleInstance_ShowEvent"
+if APP_MODE == "counter":
+    _SINGLE_INSTANCE_MUTEX_NAME = _COUNTER_MUTEX_NAME
+    _SINGLE_INSTANCE_EVENT_NAME = _COUNTER_EVENT_NAME
+else:
+    _SINGLE_INSTANCE_MUTEX_NAME = "Local\\YallaTeamEG_SingleInstance_Mutex"
+    _SINGLE_INSTANCE_EVENT_NAME = "Local\\YallaTeamEG_SingleInstance_ShowEvent"
 _single_instance_handles = []   # kept alive for the whole run so Windows holds the lock
 
 
@@ -7613,7 +7857,10 @@ def _start_single_instance_listener():
                 result = k32.WaitForSingleObject(event, 0xFFFFFFFF)  # INFINITE
                 if result == 0:  # WAIT_OBJECT_0 = signaled
                     try:
-                        _show_main_window()
+                        if APP_MODE == "counter":
+                            _ui_call(_work_open_window)
+                        else:
+                            _show_main_window()
                     except Exception:
                         pass
                 else:
@@ -7669,7 +7916,7 @@ def main():
     _build_main_window(_root)
     _pump_ui_queue()  # starts the background -> UI task pump
     _start_single_instance_listener()  # a second launch brings this window to the front
-    _work_start_feature()  # "يلا نشتغل": load the saved timer, start the send counter + the tick
+    # ("يلا نشتغل" runs as its own program now: see _counter_main / "--counter".)
     _refresh_usage(force=True)
     _root.after(5000, _schedule_update_checks)  # first update check ~5s after launch
 
@@ -7742,5 +7989,181 @@ def main():
             pass
 
 
+# =========================================================================
+# THE COUNTER PROGRAM ("يلا نشتغل", started with --counter)
+# -------------------------------------------------------------------------
+# Same .exe as the translator, but a separate process with its own clock
+# icon (window, taskbar, tray), its own single-instance lock and only the
+# work timer + sent-messages counter. It does not translate, and the
+# translator no longer counts anything.
+# =========================================================================
+def _counter_is_running() -> bool:
+    """Is the counter program open right now? (its single-instance lock exists)"""
+    if not _IS_WINDOWS:
+        return False
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenMutexW.restype = wintypes.HANDLE
+        k32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k32.OpenMutexW(0x00100000, False, _COUNTER_MUTEX_NAME)   # SYNCHRONIZE
+        if handle:
+            k32.CloseHandle(handle)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _make_clock_image(size: int = 64):
+    """The counter's icon: a white clock on a green -> teal rounded square, drawn in memory
+    (same style as the translator's globe, so the two look like a family but are easy to tell apart)."""
+    S = 256
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    grad = Image.new("RGB", (S, S), 0)
+    top_color, bottom_color = (46, 160, 67), (0, 150, 136)
+    gdraw = ImageDraw.Draw(grad)
+    for y in range(S):
+        t = y / (S - 1)
+        gdraw.line([(0, y), (S, y)], fill=tuple(int(top_color[i] + (bottom_color[i] - top_color[i]) * t)
+                                               for i in range(3)))
+    mask = Image.new("L", (S, S), 0)
+    margin, radius = int(S * 0.03), int(S * 0.22)
+    ImageDraw.Draw(mask).rounded_rectangle([margin, margin, S - margin, S - margin], radius=radius, fill=255)
+    img.paste(grad, (0, 0), mask)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([margin, margin, S - margin, S - margin], radius=radius,
+                           outline=(10, 90, 50, 170), width=max(2, S // 128))
+    cx, cy, r = S // 2, S // 2, int(S * 0.33)
+    white = (255, 255, 255, 245)
+    stroke = max(4, S // 40)
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=white, width=stroke)
+    for k in range(12):                                   # hour marks
+        a = math.radians(k * 30)
+        inner = r * (0.78 if k % 3 == 0 else 0.86)
+        draw.line([(cx + inner * math.sin(a), cy - inner * math.cos(a)),
+                   (cx + r * 0.93 * math.sin(a), cy - r * 0.93 * math.cos(a))],
+                  fill=white, width=max(3, S // 64) if k % 3 == 0 else max(2, S // 110))
+    draw.line([(cx, cy), (cx, cy - r * 0.62)], fill=white, width=stroke)                 # minute hand (12)
+    draw.line([(cx, cy), (cx + r * 0.45, cy + r * 0.12)], fill=white, width=stroke + 2)  # hour hand (~3)
+    draw.ellipse([cx - stroke, cy - stroke, cx + stroke, cy + stroke], fill=white)
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def _counter_exit():
+    """Quit the counter program for real (saves the timer first)."""
+    safe_print("[INFO] Counter: exiting...")
+    try:
+        _work_shutdown()
+    except Exception:
+        pass
+    try:
+        keyboard.unhook_all()
+    except Exception:
+        pass
+    try:
+        if _tray_icon is not None:
+            _tray_icon.visible = False
+            _tray_icon.stop()
+    except Exception:
+        pass
+    try:
+        if _root is not None:
+            _root.quit()
+            _root.destroy()
+    except Exception:
+        pass
+
+
+def _counter_confirm_exit():
+    """'خروج': ask first - while the program is closed NO messages are counted."""
+    try:
+        parent = _work_win if _work_win is not None and _work_win.winfo_exists() else None
+    except tk.TclError:
+        parent = None
+    if messagebox.askyesno(COUNTER_APP_NAME, "تقفل العدّاد خالص؟\n\nطول ما هو مقفول الرسايل مش هتتعد "
+                                             "(الوقت والعدد المحفوظ مش هيضيعوا).", parent=parent):
+        _counter_exit()
+
+
+def _build_counter_tray_icon():
+    menu = pystray.Menu(
+        pystray.MenuItem("إظهار", lambda icon, item: _ui_call(_work_open_window), default=True),
+        pystray.MenuItem("تصغير (الوقت والعدد بس)", lambda icon, item: _ui_call(_work_mini_show)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("خروج", lambda icon, item: _ui_call(_counter_confirm_exit)),
+    )
+    return pystray.Icon("yalla_team_eg_counter", _make_clock_image(64), COUNTER_APP_NAME, menu)
+
+
+def _counter_set_app_id():
+    """Its own taskbar button (not grouped with the translator, which is the same .exe)."""
+    if not _IS_WINDOWS:
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(COUNTER_APP_USER_MODEL_ID)
+    except Exception as e:
+        safe_print(f"[WARNING] Counter: could not set the taskbar id: {e}")
+
+
+def _counter_main():
+    global _tray_icon, _root
+
+    _counter_set_app_id()
+    if not _acquire_single_instance():
+        sys.exit(0)  # already running - its window was brought to the front
+
+    safe_print("=" * 60)
+    safe_print(f" {COUNTER_APP_NAME} v{APP_VERSION} is now running (work timer + sent-messages counter)")
+    safe_print("=" * 60)
+
+    try:
+        keyboard.hook(_work_key_event)      # Enter = maybe a send; other keys = typing
+    except Exception as e:
+        _fatal_error_dialog(f"Could not start the keyboard listener:\n{e}\n\n"
+                            "Try running this program as Administrator.\n\nThe program will now close.")
+        sys.exit(1)
+
+    _root = tk.Tk()
+    _root.withdraw()                         # only the "يلا نشتغل" window is shown
+    _root.title(COUNTER_APP_NAME)
+    try:
+        from PIL import ImageTk
+        _root._clock_icons = [ImageTk.PhotoImage(_make_clock_image(n)) for n in (256, 64, 32, 16)]
+        _root.iconphoto(True, *_root._clock_icons)   # True = every window of this program
+    except Exception as e:
+        safe_print(f"[WARNING] Counter: could not set the window icon: {e}")
+    _pump_ui_queue()
+    _start_single_instance_listener()        # a second launch brings the window back
+    _work_start_feature()                    # load the saved timer, start the counter + the tick
+    _work_open_window()
+
+    _tray_icon = _build_counter_tray_icon()
+    threading.Thread(target=_tray_icon.run, daemon=True).start()
+
+    try:
+        _root.mainloop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            _work_shutdown()
+        except Exception:
+            pass
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        try:
+            if _tray_icon is not None:
+                _tray_icon.visible = False
+                _tray_icon.stop()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    main()
+    if APP_MODE == "counter":
+        _counter_main()
+    else:
+        main()
