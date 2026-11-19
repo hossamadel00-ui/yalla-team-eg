@@ -209,7 +209,7 @@ COUNTER_APP_USER_MODEL_ID = "YallaTeamEG.WorkCounter"   # must match the install
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.22"
+APP_VERSION = "1.0.23"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -846,8 +846,27 @@ TONE_PRESETS = {
              "Keep game terms in their usual English form (alliance, rally, troops, hero, "
              "gift, event, server, VIP, lvl). Sound like a gamer, but NEVER change the meaning, "
              "NEVER add words or emojis that are not in the original, and keep every number exactly.",
+    # ---- 1.0.23 ----
+    "street": "STREET MODE: write it the way young people in the US actually text each other - "
+              "everyday American street slang, relaxed and confident. Lowercase is fine, light "
+              "punctuation. Use common slang ONLY where it fits naturally "
+              "(e.g. yo, bro, fam, bruh, lowkey, highkey, ngl, fr, no cap, deadass, bet, tryna, finna, "
+              "gonna, wanna, ain't, y'all, what's good, wsg, we good, my bad, say less, facts, lit, "
+              "chill, dope, I got you). Not every sentence needs slang - it must still read naturally. "
+              "NEVER add curse words, insults or slurs that are not in the original (keep a curse "
+              "only if the original has one), NEVER change the meaning, NEVER add emojis or extra "
+              "content, and keep every number and name exactly.",
+    "street+gamer": "STREET + GAMER MODE: a mix of American street slang and in-game chat style - "
+                    "how a young US gamer types in alliance / world chat. Short, lowercase, little "
+                    "punctuation. Blend street slang (yo, bro, fam, ngl, fr, no cap, lowkey, bet, tryna, "
+                    "finna, deadass, wsg, say less) with gamer shorthand (gg, wp, gl, ty, thx, pls, np, "
+                    "rn, omw, brb, afk, idk, lol, u, ur, op, nerf/buff, lag) ONLY where it fits naturally. "
+                    "Keep game terms in their usual English form (alliance, rally, troops, hero, gift, "
+                    "event, server, VIP, lvl, R4/R5). NEVER add curse words, insults or slurs that are "
+                    "not in the original, NEVER change the meaning, NEVER add emojis or extra content, "
+                    "and keep every number and name exactly.",
 }
-TONE_ORDER = ["normal", "formal", "casual", "gamer"]
+TONE_ORDER = ["normal", "formal", "casual", "gamer", "street", "street+gamer"]
 DEFAULT_TONE = "normal"
 _translation_tone = _saved_config.get("translation_tone", DEFAULT_TONE)
 if _translation_tone not in TONE_PRESETS:
@@ -2714,6 +2733,10 @@ def _build_ai_prompt(sentence: str, from_name: str, to_name: str) -> str:
     """The USER message shared by every AI engine (the rules live in _AI_SYSTEM_PROMPT)."""
     tone = TONE_PRESETS.get(_translation_tone, TONE_PRESETS[DEFAULT_TONE])
     examples = _AI_FEW_SHOT if (from_name, to_name) == ("Arabic", "English") else ""
+    if examples and _translation_tone not in ("normal", "casual"):
+        # The examples are in a neutral register: make sure they do not pull the
+        # gamer / street styles back to plain English.
+        examples += "(The examples only show the meaning - write YOUR answer in the Style above.)\n"
     return (
         f"Translate from {from_name} to {to_name}.\n"
         f"Style: {tone}\n"
@@ -3397,7 +3420,11 @@ SETTINGS_HELP.update({
         "• normal: عادي وطبيعي.\n"
         "• formal: رسمي ومحترم (للإيميلات والشغل).\n"
         "• casual: عامية وودّية (للشات مع الأصحاب).\n"
-        "• gamer: أسلوب لاعبين في شات الألعاب (pls, ty, gg, rn, afk...).\n\n"
+        "• gamer: أسلوب لاعبين في شات الألعاب (pls, ty, gg, rn, afk...).\n"
+        "• street: لغة الشارع الأمريكي (yo, bro, fam, ngl, fr, no cap, bet...).\n"
+        "• street+gamer: خليط بين لغة الشارع ولغة الجيمرز (yo bro, gg, rn, fr...).\n\n"
+        "street و street+gamer عمرهم ما بيزوّدوا شتايم من عندهم، وبيحافظوا على "
+        "المعنى والأرقام زي ما هي.\n\n"
         "بتأثر على Claude وGemini والـ custom بس. جوجل وDeepL مش بياخدوا "
         "تعليمات فمش هيتأثروا.\n\n"
         "تقدر كمان تحط مفتاح سريع (مثلاً ctrl+alt+t) تبدّل بيه بين النبرات "
@@ -4054,7 +4081,7 @@ def _open_settings_window():
              font=("Arial", 10)).pack(side="left", anchor="w")
     tone_hotkey_var = tk.StringVar(value=_tone_trigger_key)
     tk.Entry(extras_tab, textvariable=tone_hotkey_var, font=("Arial", 10)).pack(fill="x", padx=15, pady=(0, 2))
-    tk.Label(extras_tab, text="(the tone itself - formal / normal / casual / gamer - is picked on the "
+    tk.Label(extras_tab, text="(the tone itself - formal / normal / casual / gamer / street / street+gamer - is picked on the "
                               "main window; AI engines only)", **_note).pack(anchor="w", padx=15, pady=(0, 4))
 
     # ---- Cache ----
@@ -7383,6 +7410,13 @@ def _tray_open_work(icon, item):
 # Keep the newest version first. Plain Egyptian Arabic for the players.
 # =========================================================================
 WHATS_NEW = [
+    ("1.0.23", [
+        "🗽 أسلوب ترجمة جديد street: لغة الشارع الأمريكي (yo bro, ngl, fr, no cap, bet...).",
+        "🎮 أسلوب ترجمة جديد street+gamer: خليط بين لغة الشارع ولغة الجيمرز (yo bro, gg, rn, omw...).",
+        "🔁 تختارهم من نفس مكان أسلوب الترجمة (Tone) في الشاشة الرئيسية أو القايمة اللي جنب الساعة. "
+        "بيشتغلوا مع محركات الذكاء الاصطناعي (زي Gemini).",
+        "🚫 الأسلوبين دول عمرهم ما بيزوّدوا شتايم من عندهم، وبيحافظوا على المعنى والأرقام.",
+    ]),
     ("1.0.22", [
         "🛡️ منع إرسال العربي: في اللعبة لو دوست Enter أو سهم الإرسال والكلام لسه عربي، "
         "الرسالة مش هتتبعت. هتسمع صوت تنبيه والبرنامج هيترجم لوحده، ودوس Enter تاني عشان تتبعت.",
