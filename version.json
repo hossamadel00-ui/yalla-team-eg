@@ -1,5 +1,5 @@
 {
-  "version": "1.0.21",
-  "url": "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/setup/YallaTeam_Setup_v1.0.21.exe",
-  "notes": "العداد بقى برنامج لوحده بأيقونة ساعة + بيعد في نسخة اللعبة العربي + مبقاش يعد زراير المهام الخضرا"
+  "version": "1.0.22",
+  "url": "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/setup/YallaTeam_Setup_v1.0.22.exe",
+  "notes": "منع إرسال العربي في اللعبة + الأرقام بقت بتتترجم صح + خيار مسح الخانة كلها + تبويب Game في الإعدادات"
 }
