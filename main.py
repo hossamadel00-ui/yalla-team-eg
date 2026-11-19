@@ -209,7 +209,7 @@ COUNTER_APP_USER_MODEL_ID = "YallaTeamEG.WorkCounter"   # must match the install
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.23"
+APP_VERSION = "1.0.24"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -6413,9 +6413,13 @@ def _work_input_bar_beside(rect, found) -> tuple:
         frac = _work_light_fraction(data, width, 0, 0, width)
         return frac >= _WORK_TYPING_BAR_MIN_LIGHT, f"typing bar under the edge: {frac:.0%} light"
     d = max(bw, bh)
-    data = _work_grab(rect.left, cy - 3, width, 7)
+    # 1.0.24: rows above and below the middle too - typed text runs through the middle
+    # of the box and its letters made long messages fail this check.
+    off = max(3, int(d * 0.28))
+    data = _work_grab(rect.left, cy - off, width, 2 * off + 1)
     if not data:
         return False, "could not read the screen"
+    rows = (0, off // 2, off, off + off // 2, 2 * off)
     local_cx = cx - rect.left
     length = max(int(d * 2.5), int(width * 0.22))
     best = 0.0
@@ -6425,7 +6429,7 @@ def _work_input_bar_beside(rect, found) -> tuple:
         a, b = max(0, a), min(width, b)
         if b - a < d:
             continue
-        frac = sum(_work_light_fraction(data, width, row, a, b) for row in (1, 3, 5)) / 3.0
+        frac = max(_work_light_fraction(data, width, row, a, b) for row in rows)
         best = max(best, frac)
     return best >= _WORK_BAR_MIN_LIGHT, f"input box beside the arrow: {best:.0%} light"
 
@@ -6529,12 +6533,84 @@ def _work_foreground_emulator_rect():
     return _work_foreground_emulator()[1]
 
 
-def _work_send_was_blocked() -> bool:
-    """Did the translator's game guard block a send just now? (it touches GUARD_SIGNAL_PATH)"""
+def _work_send_was_blocked(stamp: float) -> bool:
+    """Did the translator's game guard block THIS send? It touches GUARD_SIGNAL_PATH in the
+    same instant it blocks a key/click, so compare with the moment of this event."""
     try:
-        return abs(time.time() - os.path.getmtime(GUARD_SIGNAL_PATH)) < 1.0
+        event_wall = time.time() - (time.monotonic() - stamp)
+        delta = os.path.getmtime(GUARD_SIGNAL_PATH) - event_wall
+        return -0.25 <= delta <= 0.6
     except Exception:
         return False
+
+
+WORK_LOG_PATH = os.path.join(CONFIG_DIR, "work_counter_log.txt")
+WORK_LOG_MAX_BYTES = 300_000
+
+
+def _work_log(kind: str, result: str):
+    """One line per Enter / click in the emulator: counted or not, and WHY (never the message text)."""
+    try:
+        if os.path.exists(WORK_LOG_PATH) and os.path.getsize(WORK_LOG_PATH) > WORK_LOG_MAX_BYTES:
+            os.replace(WORK_LOG_PATH, WORK_LOG_PATH + ".old")
+        with open(WORK_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {kind:5}  {result}\n")
+    except Exception:
+        pass
+
+
+def _work_click_on_typing_bar_ok(rect, x: int, y: int) -> bool:
+    """1.0.24: a click on 'OK' of the emulator's white typing bar (the bar the phone keyboard
+    opens over the chat while you type - it covers the green arrow, and OK sends from there)."""
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width < 120 or height < 120:
+        return False
+    if y < rect.top + height * 0.82 or y > rect.bottom or x < rect.left + width * 0.68 or x > rect.right:
+        return False
+    row = _work_grab(rect.left, y, width, 1)
+    if not row or _work_light_fraction(row, width, 0, 0, width) < 0.80:
+        return False                       # no full-width white bar on that line
+    box = _work_grab(x - 20, y - 10, 41, 21)
+    if not box:
+        return False
+    light = sum(_work_light_fraction(box, 41, r, 0, 41, step=1) for r in range(0, 21, 4)) / 6.0
+    return light >= 0.65                   # OK is grey letters on white: mostly light around the cursor
+
+
+def _work_detect_send(kind: str, rect, x=None, y=None):
+    """One screen check. (pos, why_not): pos = where to show "+1" when it is a send."""
+    check_color = _work_cfg["color_check"]
+    strict = _work_cfg.get("strict_shape", True)
+    if kind == "enter":
+        if not check_color:
+            return _work_cursor_pos(), ""
+        if strict:
+            found = _work_find_send_button(rect)          # a round green arrow (or its top edge)
+            if found is None:
+                bits = []
+                for side in _WORK_SIDES:
+                    f = _work_find_send_button_side(rect, side)
+                    if f:
+                        bits.append(f"{side}: {f[0]}, {_work_input_bar_beside(rect, f)[1]}")
+                return None, ("no send arrow on the screen" if not bits
+                              else "arrow found but no input box: " + "; ".join(bits))
+            return (found[1], found[2]), ""
+        if not _work_green_blob_in_window(rect):            # old rule: any green in a bottom corner
+            return None, "no green in the bottom corners"
+        return _work_cursor_pos(), ""
+    # click
+    if not check_color:
+        inside = rect.left <= x <= rect.right and rect.top <= y <= rect.bottom
+        return ((x, y), "") if inside else (None, "click outside the emulator")
+    if strict:
+        if _work_click_hits_send_button(rect, x, y):
+            return (x, y), ""
+        if _work_click_on_typing_bar_ok(rect, x, y):
+            return (x, y), ""
+        return None, "click was not on the send arrow / OK"
+    if _work_click_is_send_button(x, y):
+        return (x, y), ""
+    return None, "no green under the click"
 
 
 def _work_handle_event(event):
@@ -6544,41 +6620,38 @@ def _work_handle_event(event):
         return                                  # stale (the worker was starved): ignore
     hwnd, rect = _work_foreground_emulator()
     if rect is None:
-        return                                  # emulator is not in front: no counting
-    wait = stamp + 0.10 - time.monotonic()      # give the translator's guard time to mark a blocked send
+        return                                  # emulator is not in front: no counting (no log line either)
+    if kind not in ("enter", "click"):
+        return
+    x, y = (event[1], event[2]) if kind == "click" else (None, None)
+    typed = (not _work_cfg.get("need_typing", True)) or _work_typed_before(stamp, hwnd)
+    if not typed:
+        if kind == "enter":                     # (ordinary clicks in the game are not logged)
+            _work_log(kind, "NOT counted - nothing typed since the last counted message")
+        return
+    # 1.0.24: look at the screen RIGHT AWAY (the arrow changes as soon as it is pressed and
+    # the typing bar closes), and once or twice more while the screen is changing.
+    pos, why_not = _work_detect_send(kind, rect, x, y)
+    for delay in (0.15, 0.35):
+        if pos is not None:
+            break
+        time.sleep(delay)
+        hwnd2, rect2 = _work_foreground_emulator()
+        if rect2 is not None:
+            pos, why_not = _work_detect_send(kind, rect2, x, y)
+    if pos is None:
+        _work_log(kind, f"NOT counted - {why_not}")
+        return
+    wait = stamp + 0.15 - time.monotonic()      # the translator's guard marks a blocked send at once
     if wait > 0:
         time.sleep(wait)
-    if _work_send_was_blocked():
-        return                                  # the translator blocked it (still Arabic): not sent
-    if _work_cfg.get("need_typing", True) and not _work_typed_before(stamp, hwnd):
-        return                                  # nothing typed since the last message: a quest/task button
-    check_color = _work_cfg["color_check"]
-    strict = _work_cfg.get("strict_shape", True)
-    pos = None                                  # where the little "+1" will appear
-    if kind == "enter":
-        if check_color:
-            if strict:
-                found = _work_find_send_button(rect)     # a round green arrow (or its top edge)
-                if found is None:
-                    return
-                pos = (found[1], found[2])
-            elif not _work_green_blob_in_window(rect):   # old rule: any green in a bottom corner
-                return
-        pos = pos or _work_cursor_pos()
-    elif kind == "click":
-        x, y = event[1], event[2]
-        if check_color:
-            if strict:
-                if not _work_click_hits_send_button(rect, x, y):
-                    return
-            elif not _work_click_is_send_button(x, y):
-                return
-        elif not (rect.left <= x <= rect.right and rect.top <= y <= rect.bottom):
-            return                              # fallback mode: any click INSIDE the emulator window
-        pos = (x, y)
-    else:
+    if _work_send_was_blocked(stamp):
+        _work_log(kind, "NOT counted - the translator blocked it (still Arabic)")
         return
-    _work_register_send(stamp, pos)
+    if _work_register_send(stamp, pos):
+        _work_log(kind, f"COUNTED (#{_work.get('count')})")
+    else:
+        _work_log(kind, "NOT counted - same message as the one just counted (double send)")
 
 
 def _work_worker_loop():
@@ -7410,6 +7483,13 @@ def _tray_open_work(icon, item):
 # Keep the newest version first. Plain Egyptian Arabic for the players.
 # =========================================================================
 WHATS_NEW = [
+    ("1.0.24", [
+        "⏱️ العداد بقى بيعد الرسالة لما تبعتها بزرار OK اللي في شريط الكتابة (مش بس Enter والسهم الأخضر).",
+        "⏱️ العداد بقى بيبص على الشاشة لحظة الإرسال بالظبط، فمبقاش بيفوّت أول رسالة بعد الترجمة.",
+        "⏱️ الرسايل الطويلة بقت بتتعد عادي (الكلام المكتوب في الخانة كان بيلخبط الكشف).",
+        "🛡️ منع إرسال العربي بقى بيمنع زرار OK كمان.",
+        "📝 سجل للعداد work_counter_log.txt: كل رسالة اتعدّت ولا لأ وليه (من غير نص الرسايل).",
+    ]),
     ("1.0.23", [
         "🗽 أسلوب ترجمة جديد street: لغة الشارع الأمريكي (yo bro, ngl, fr, no cap, bet...).",
         "🎮 أسلوب ترجمة جديد street+gamer: خليط بين لغة الشارع ولغة الجيمرز (yo bro, gg, rn, omw...).",
@@ -7623,7 +7703,8 @@ def _guard_mouse_callback(n_code, w_param, l_param):
                 info = ctypes.cast(l_param, ctypes.POINTER(_GuardMouseHook)).contents
                 if not (info.flags & 0x01) and _guard_pending_arabic() and _guard_app_in_front():
                     hwnd, rect = _work_foreground_emulator_any()
-                    if rect is not None and _work_click_hits_send_button(rect, info.pt.x, info.pt.y):
+                    if rect is not None and (_work_click_hits_send_button(rect, info.pt.x, info.pt.y)
+                                             or _work_click_on_typing_bar_ok(rect, info.pt.x, info.pt.y)):
                         _guard_swallow_click_up = True
                         _guard_block("click on the send arrow")
                         return 1
