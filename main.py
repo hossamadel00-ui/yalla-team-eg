@@ -209,7 +209,7 @@ COUNTER_APP_USER_MODEL_ID = "YallaTeamEG.WorkCounter"   # must match the install
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.22"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -880,6 +880,39 @@ if isinstance(_raw_app_rules, dict):
     }
 else:
     _app_speed_rules = dict(DEFAULT_APP_SPEED_RULES)
+
+
+# ---- "Game guard" (1.0.22) -----------------------------------------------
+# In the programs picked here (the emulator by default):
+#   * Enter / a click on the green send arrow while the chat box still holds
+#     UNTRANSLATED Arabic is blocked: a beep + notice, and the Arabic is
+#     translated in place - press Enter again to send the English.
+#   * optional: before typing a translation, select the whole input box
+#     (Ctrl+A) and delete it, so no Arabic letter can ever be left behind.
+GUARD_APP_PRESETS = [
+    ("BlueStacks", "hd-player.exe"), ("LDPlayer", "dnplayer.exe"), ("Nox", "nox.exe"),
+    ("MEmu", "memu.exe"), ("MuMu", "mumuplayer.exe"),
+    ("Chrome", "chrome.exe"), ("Edge", "msedge.exe"), ("Firefox", "firefox.exe"),
+]
+DEFAULT_GUARD_APPS = ["hd-player.exe", "dnplayer.exe", "nox.exe", "memu.exe", "mumuplayer.exe"]
+_guard_enabled = bool(_saved_config.get("guard_block_arabic", True))
+_guard_clear_field = bool(_saved_config.get("guard_clear_field", False))
+_raw_guard_apps = _saved_config.get("guard_apps", DEFAULT_GUARD_APPS)
+_guard_apps = {str(a).strip().lower() for a in (_raw_guard_apps if isinstance(_raw_guard_apps, list)
+                                                else DEFAULT_GUARD_APPS) if str(a).strip()}
+# Touched by the translator whenever it blocks a send, so the separate
+# "يلا نشتغل" counter program does not count that blocked Enter/click.
+GUARD_SIGNAL_PATH = os.path.join(CONFIG_DIR, "send_blocked.signal")
+
+
+def _guard_parse_apps(text: str) -> set:
+    """'a.exe, b' -> {'a.exe', 'b.exe'}"""
+    apps = set()
+    for part in re.split(r"[,\n;]+", text or ""):
+        name = part.strip().lower()
+        if name:
+            apps.add(name if name.endswith(".exe") else name + ".exe")
+    return apps
 
 
 def _parse_app_speed_rules(text: str):
@@ -1798,6 +1831,34 @@ def _append_clipboard_to_buffer():
             safe_print(f"[DEBUG] paste -> buffer={_buffer!r}")
 
 
+def _key_is_part_of_held_hotkey(name: str, combo) -> bool:
+    """True if 'name' belongs to the hotkey 'combo' AND the other keys of that combo
+    are held right now (a single-key hotkey like 'scroll lock' always counts)."""
+    if not combo or name not in combo:
+        return False
+    for other in combo:
+        if other == name:
+            continue
+        try:
+            if not keyboard.is_pressed(other):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+_last_replace_ok = False   # did the last typed-text translation get written?
+_buffer_hwnd = 0   # the window the tracked sentence was typed in (for the game guard)
+
+
+def _note_buffer_window():
+    global _buffer_hwnd
+    try:
+        _buffer_hwnd = int(_user32.GetForegroundWindow() or 0)
+    except Exception:
+        _buffer_hwnd = 0
+
+
 def _on_key_event(event):
     """
     Raw keyboard hook callback. Runs on every key press system-wide.
@@ -1834,8 +1895,13 @@ def _on_key_event(event):
     # Ignore any key that is part of any of the three hotkey combos
     # (translate / popup / select) - the dedicated hotkey handlers
     # take care of those.
-    if (name in _trigger_components or name in _popup_trigger_components
-            or name in _select_trigger_components or name in _tone_trigger_components):
+    # FIX (1.0.22): only ignore a key when it is being used AS PART OF a hotkey
+    # (the rest of that combo is held down). With hotkeys like Alt+1 / Alt+2 /
+    # Alt+3, the digits 1, 2 and 3 typed on their own were silently dropped from
+    # the sentence - "عندي 25" became "عندي 5" and one Arabic letter was left behind.
+    if any(_key_is_part_of_held_hotkey(name, combo) for combo in (
+            _trigger_components, _popup_trigger_components,
+            _select_trigger_components, _tone_trigger_components)):
         return
 
     # Other modifier keys alone: ignore, don't touch the buffer
@@ -1894,7 +1960,14 @@ def _on_key_event(event):
     # is unavailable (non-Windows) or fails for any reason.
     scan_code = getattr(event, "scan_code", 0) or 0
     shift_pressed = keyboard.is_pressed("shift")
-    resolved_char = _resolve_typed_char(scan_code, shift_pressed)
+    if getattr(event, "is_keypad", False) and len(name) == 1 and (name.isdigit() or name in "+-*/."):
+        # FIX (1.0.22): numpad keys. Their scan codes map to the ARROW keys
+        # (numpad 2 = Down...), so the layout lookup below cannot give the digit;
+        # one numpad digit could be dropped from the sentence, and then one
+        # Arabic letter was left behind after the translation.
+        resolved_char = name
+    else:
+        resolved_char = _resolve_typed_char(scan_code, shift_pressed)
     typed_char = resolved_char if len(resolved_char) == 1 else (name if len(name) == 1 else "")
 
     if DEBUG_MODE:
@@ -1913,6 +1986,7 @@ def _on_key_event(event):
     # any Arabic has been typed (i.e. this clearly isn't an Arabic
     # sentence at all).
     if typed_char:
+        _note_buffer_window()
         with _buffer_lock:
             if _is_arabic_char(typed_char):
                 _buffer += typed_char
@@ -2185,6 +2259,7 @@ def _translate_selection(sentence: str, previous_clipboard):
     original selection is left exactly as it was), so you never lose
     what you selected just because a translation glitched.
     """
+    globals()["_last_replace_ok"] = False
     direction = f"ar-{_target_language}"
     _remember_job("selection", sentence, direction)
     _working_show()
@@ -2215,6 +2290,7 @@ def _translate_selection(sentence: str, previous_clipboard):
     _restore_clipboard(previous_clipboard)
 
     safe_print(f"[OK] Replaced selection with: {translated_text}")
+    globals()["_last_replace_ok"] = True
     _report_fallback_if_used("Selection translated", fallback_info)
     _report_success("Selection translated", translated_text)
 
@@ -2317,8 +2393,12 @@ def _translate_typed_buffer(arabic_sentence: str, app_name: str = ""):
     apps, but games/emulators that drop fast synthetic input need the
     slower "safe" profile to avoid dropped or scrambled characters.
     """
+    global _last_replace_ok
+    _last_replace_ok = False
     direction = f"ar-{_target_language}"
     _remember_job("typed", arabic_sentence, direction)
+    safe_print(f"[INFO] Captured sentence ({len(arabic_sentence)} chars): {arabic_sentence!r}")
+    _append_log_to_file("INFO", "Captured sentence", f"{len(arabic_sentence)} chars: {arabic_sentence}", "")
     _working_show()
     try:
         translated_text, fallback_info = _translate_with_fallback(arabic_sentence, direction)
@@ -2346,10 +2426,17 @@ def _translate_typed_buffer(arabic_sentence: str, app_name: str = ""):
     if DEBUG_MODE:
         safe_print(f"[DEBUG] target app={app_name!r} speed={speed_profile} delay={key_delay}")
 
-    delete_count = len(arabic_sentence)
-    for _ in range(delete_count):
+    if _guard_clear_field and (app_name or "").lower() in _guard_apps:
+        # Option: select the whole input box and delete it (never leaves a letter behind).
+        keyboard.send("ctrl+a")
+        time.sleep(max(key_delay, 0.06))
         keyboard.send("backspace")
-        time.sleep(key_delay)
+        time.sleep(max(key_delay, 0.06))
+    else:
+        delete_count = len(arabic_sentence)
+        for _ in range(delete_count):
+            keyboard.send("backspace")
+            time.sleep(key_delay)
 
     # Long translations are pasted in one go (faster and safer than typing
     # every key) - except in 'safe' mode, which exists for apps that dislike
@@ -2361,6 +2448,7 @@ def _translate_typed_buffer(arabic_sentence: str, app_name: str = ""):
         keyboard.write(translated_text, delay=key_delay)
 
     safe_print(f"[OK] Replaced with: {translated_text}")
+    _last_replace_ok = True
     _report_fallback_if_used("Typed text translated", fallback_info)
     _report_success("Typed text translated", translated_text)
 
@@ -3354,6 +3442,33 @@ SETTINGS_HELP.update({
         "اسم البرنامج هتلاقيه في Task Manager > Details. أي برنامج مش في "
         "القايمة بيستخدم السرعة العامة اللي في الشاشة الرئيسية (Typing speed)."
     ),
+    "guard_block": (
+        "Block Arabic - منع إرسال العربي",
+        "في البرامج اللي متعلّم عليها تحت (المحاكي من الأول): لو دوست Enter أو "
+        "ضغطت على سهم الإرسال الأخضر والكلام اللي كتبته لسه عربي ومترجمتوش، "
+        "الرسالة مش هتتبعت.\n\n"
+        "هتسمع صوت تنبيه، والبرنامج هيترجم الكلام لوحده ويكتب الترجمة مكانه. "
+        "بص عليها ودوس Enter تاني عشان تتبعت.\n\n"
+        "لو الترجمة فشلت (مثلاً النت قاطع) الإرسال يفضل ممنوع.\n\n"
+        "الرسالة اللي اتمنعت مش بتتعد في \"يلا نشتغل\".\n\n"
+        "البرنامج بيعرف إن الكلام عربي من اللي كتبته بالكيبورد (أو لصقته "
+        "بـ Ctrl+V). لصق بالماوس (كليك يمين) مش بيتعرف."
+    ),
+    "guard_clear": (
+        "Clear the box - امسح الخانة كلها",
+        "قبل ما البرنامج يكتب الترجمة، بيحدد خانة الكتابة كلها (Ctrl+A) "
+        "ويمسحها، بدل ما يمسح حرف حرف.\n\n"
+        "كده عمره ما هيسيب حرف عربي مهما حصل. بس لو كان في الخانة كلام "
+        "قبل الجملة اللي بتترجمها، هيتمسح هو كمان.\n\n"
+        "بيشتغل بس في البرامج اللي متعلّم عليها تحت."
+    ),
+    "guard_apps": (
+        "Programs - البرامج",
+        "الخيارين اللي فوق بيشتغلوا بس في البرامج دي.\n\n"
+        "لو المحاكي بتاعك مش في القايمة، اكتب اسمه في الخانة (اسم الـ .exe "
+        "هتلاقيه في Task Manager > Details)، ولو أكتر من واحد افصل بينهم "
+        "بفاصلة."
+    ),
 })
 
 
@@ -3468,6 +3583,35 @@ def _open_settings_window():
     # Everything that is rarely changed lives in one scrollable tab.
     advanced_tab = _make_scrollable_tab(notebook, win, "Advanced")
     extras_tab = advanced_tab
+    game_tab = tk.Frame(notebook)
+    notebook.add(game_tab, text="Game")
+
+    # ======================= GAME TAB (1.0.22) =======================
+    guard_row = _setting_row(game_tab, "guard_block", padding)
+    guard_block_var = tk.BooleanVar(value=_guard_enabled)
+    tk.Checkbutton(guard_row, text="امنع إرسال الكلام العربي اللي متترجمش - وترجمه لوحده",
+                   variable=guard_block_var, font=("Segoe UI", 10)).pack(side="left", anchor="w")
+    tk.Label(game_tab, text="(Enter أو سهم الإرسال الأخضر: صوت تنبيه + ترجمة، وبعدين Enter تاني يبعت)",
+             font=("Segoe UI", 8), fg="gray").pack(anchor="w", padx=30)
+    clear_row = _setting_row(game_tab, "guard_clear", padding)
+    guard_clear_var = tk.BooleanVar(value=_guard_clear_field)
+    tk.Checkbutton(clear_row, text="قبل كتابة الترجمة امسح خانة الكتابة كلها (Ctrl+A)",
+                   variable=guard_clear_var, font=("Segoe UI", 10)).pack(side="left", anchor="w")
+    apps_row = _setting_row(game_tab, "guard_apps", padding)
+    tk.Label(apps_row, text="في البرامج دي:", font=("Segoe UI", 10, "bold")).pack(side="left", anchor="w")
+    guard_app_vars = {}
+    presets_frame = tk.Frame(game_tab)
+    presets_frame.pack(fill="x", padx=30)
+    for index, (label, exe) in enumerate(GUARD_APP_PRESETS):
+        var = tk.BooleanVar(value=exe in _guard_apps)
+        guard_app_vars[exe] = var
+        tk.Checkbutton(presets_frame, text=f"{label}  ({exe})", variable=var,
+                       font=("Segoe UI", 9)).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 12))
+    preset_names = {exe for _label, exe in GUARD_APP_PRESETS}
+    tk.Label(game_tab, text="برامج تانية (اسم الـ .exe، وافصل بفاصلة):", font=("Segoe UI", 9)).pack(
+        anchor="w", padx=30, pady=(8, 0))
+    guard_extra_var = tk.StringVar(value=", ".join(sorted(_guard_apps - preset_names)))
+    tk.Entry(game_tab, textvariable=guard_extra_var, font=("Consolas", 9)).pack(fill="x", padx=30)
 
     # ======================= GENERAL TAB =======================
     # ---- Enabled checkbox ----
@@ -3992,6 +4136,10 @@ def _open_settings_window():
     tk.Button(
         advanced_tab, text="Check for updates", font=("Arial", 10), command=_check_for_update_manual
     ).pack(anchor="w", padx=15, pady=(0, 6))
+    tk.Button(
+        advanced_tab, text="What's new - إيه الجديد", font=("Arial", 10),
+        command=lambda: _show_whats_new(win)
+    ).pack(anchor="w", padx=15, pady=(0, 6))
 
     tk.Label(
         advanced_tab,
@@ -4077,6 +4225,18 @@ def _open_settings_window():
             if new_paste_threshold != _paste_threshold:
                 _paste_threshold = new_paste_threshold
                 _save_config(paste_threshold=_paste_threshold)
+
+        global _guard_enabled, _guard_clear_field, _guard_apps
+        new_guard_apps = {exe for exe, var in guard_app_vars.items() if var.get()}
+        new_guard_apps |= _guard_parse_apps(guard_extra_var.get())
+        if (guard_block_var.get() != _guard_enabled or guard_clear_var.get() != _guard_clear_field
+                or new_guard_apps != _guard_apps):
+            _guard_enabled = bool(guard_block_var.get())
+            _guard_clear_field = bool(guard_clear_var.get())
+            _guard_apps = new_guard_apps
+            _save_config(guard_block_arabic=_guard_enabled, guard_clear_field=_guard_clear_field,
+                         guard_apps=sorted(_guard_apps))
+            _guard_start()     # no-op if already running or switched off
 
         new_rules, bad_rule_lines = _parse_app_speed_rules(app_rules_text.get("1.0", "end"))
         if bad_rule_lines:
@@ -6342,6 +6502,14 @@ def _work_foreground_emulator_rect():
     return _work_foreground_emulator()[1]
 
 
+def _work_send_was_blocked() -> bool:
+    """Did the translator's game guard block a send just now? (it touches GUARD_SIGNAL_PATH)"""
+    try:
+        return abs(time.time() - os.path.getmtime(GUARD_SIGNAL_PATH)) < 1.0
+    except Exception:
+        return False
+
+
 def _work_handle_event(event):
     """Worker thread: decide whether one Enter / one click is a sent message."""
     kind, stamp = event[0], event[-1]
@@ -6350,6 +6518,11 @@ def _work_handle_event(event):
     hwnd, rect = _work_foreground_emulator()
     if rect is None:
         return                                  # emulator is not in front: no counting
+    wait = stamp + 0.10 - time.monotonic()      # give the translator's guard time to mark a blocked send
+    if wait > 0:
+        time.sleep(wait)
+    if _work_send_was_blocked():
+        return                                  # the translator blocked it (still Arabic): not sent
     if _work_cfg.get("need_typing", True) and not _work_typed_before(stamp, hwnd):
         return                                  # nothing typed since the last message: a quest/task button
     check_color = _work_cfg["color_check"]
@@ -7203,6 +7376,275 @@ def _tray_open_work(icon, item):
     _ui_call(_work_open_window)
 
 
+
+# =========================================================================
+# "WHAT'S NEW" (1.0.22): shown ONCE, the first time the program opens after
+# an update. Re-opened any time from Settings > Advanced > "What's new".
+# Keep the newest version first. Plain Egyptian Arabic for the players.
+# =========================================================================
+WHATS_NEW = [
+    ("1.0.22", [
+        "🛡️ منع إرسال العربي: في اللعبة لو دوست Enter أو سهم الإرسال والكلام لسه عربي، "
+        "الرسالة مش هتتبعت. هتسمع صوت تنبيه والبرنامج هيترجم لوحده، ودوس Enter تاني عشان تتبعت.",
+        "🔢 الأرقام بقت بتتترجم صح: الأرقام 1 و 2 و 3 كانت بتضيع من الجملة (مثلاً 25 بقت 5) "
+        "وكان بيفضل حرف عربي بعد الترجمة. اتصلّحت.",
+        "🧹 خيار جديد: امسح خانة الكتابة كلها (Ctrl+A) قبل كتابة الترجمة - عمره ما هيسيب حرف عربي.",
+        "⚙️ تبويب جديد في الإعدادات اسمه Game: تشغّل وتقفل الحاجات دي وتختار البرامج اللي تشتغل فيها "
+        "(المحاكي متعلّم عليه من الأول).",
+        "⏱️ الرسالة اللي اتمنعت مش بتتعد في \"يلا نشتغل\".",
+    ]),
+    ("1.0.21", [
+        "⏱️ \"يلا نشتغل\" بقى برنامج لوحده بأيقونة ساعة خضرا على الديسكتوب - تفتحه وتقفله "
+        "من غير المترجم.",
+        "🇸🇦 العداد بقى بيعد في نسخة اللعبة العربي (السهم على الشمال).",
+        "✅ العداد مبقاش بيعد زراير المهام الخضرا - بيعد بس لما تكون كتبت حاجة.",
+    ]),
+]
+
+
+def _show_whats_new(parent=None):
+    """The 'What's new' window (newest version on top)."""
+    try:
+        win = tk.Toplevel(parent or _root)
+        win.title(f"إيه الجديد - v{APP_VERSION}")
+        win.resizable(False, True)
+        win.geometry("470x520")
+        tk.Label(win, text=f"🎉 اتحدّث البرنامج لـ {APP_VERSION}", font=("Segoe UI", 15, "bold"),
+                 anchor="e", justify="right").pack(fill="x", padx=16, pady=(14, 2))
+        tk.Label(win, text="ده اللي جديد:", font=("Segoe UI", 10), fg="gray",
+                 anchor="e").pack(fill="x", padx=16)
+        body = tk.Text(win, wrap="word", font=("Segoe UI", 11), relief="flat", height=18,
+                       padx=10, pady=8, cursor="arrow")
+        body.tag_configure("rtl", justify="right", spacing1=3, spacing3=7)
+        body.tag_configure("head", justify="right", font=("Segoe UI", 12, "bold"), spacing1=10, spacing3=4)
+        for index, (version, items) in enumerate(WHATS_NEW):
+            title = f"الإصدار {version}" + ("  (الجديد)" if index == 0 else "")
+            body.insert("end", title + "\n", "head")
+            for item in items:
+                body.insert("end", item + "\n", "rtl")
+        body.config(state="disabled")
+        body.pack(fill="both", expand=True, padx=12, pady=(8, 4))
+        ok = tk.Button(win, text="تمام", width=14, command=win.destroy)
+        _style_button(ok, "accent")
+        ok.pack(pady=(4, 12), ipady=3)
+        _theme_apply_to(win)
+        _set_dark_titlebar(win, _theme_name == "dark")
+        win.lift()
+        win.focus_force()
+    except Exception as e:
+        safe_print(f"[WARNING] Could not show 'What's new': {e}")
+
+
+def _maybe_show_whats_new():
+    """First start after an update: show 'What's new' once. (A brand-new install shows nothing.)"""
+    try:
+        seen = str(_load_config().get("last_seen_version", "") or "")
+    except Exception:
+        seen = ""
+    if seen != APP_VERSION:
+        _save_config(last_seen_version=APP_VERSION)
+        if seen and _version_tuple(seen) < _version_tuple(APP_VERSION):
+            _show_whats_new()
+        elif not seen and _saved_config:
+            _show_whats_new()      # updated from a version that did not remember this yet
+
+
+def _version_tuple(text: str):
+    try:
+        return tuple(int(p) for p in str(text).strip().lstrip("vV").split("."))
+    except Exception:
+        return (0,)
+
+
+# =========================================================================
+# GAME GUARD (1.0.22): never send untranslated Arabic
+# -------------------------------------------------------------------------
+# In the programs listed in Settings > Game (the emulator by default), while
+# the sentence typed in that window still holds Arabic (or a translation is
+# being written), Enter and a click on the green send arrow are BLOCKED:
+# a beep + notice, then the Arabic is translated in place like the trigger
+# key does. Pressing Enter again afterwards sends the English.
+# Runs in the translator only. Its own low-level keyboard + mouse hooks
+# (one thread with a message loop) - the 'keyboard' library cannot block
+# a single key without slowing every other key down.
+# =========================================================================
+if _IS_WINDOWS:
+    class _GuardKbdHook(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _GuardMouseHook(ctypes.Structure):
+        _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+_guard_thread_started = False
+_guard_proc_refs = []             # keep the ctypes callbacks alive
+_guard_swallow_enter_up = False   # also eat the key-up of a blocked Enter
+_guard_swallow_click_up = False   # ...and the button-up of a blocked click
+_guard_last_block = 0.0
+_guard_last_notice = 0.0
+GUARD_NOTICE_EVERY_SECONDS = 20.0  # the Windows notification at most this often (the beep every time)
+
+
+def _guard_pending_arabic() -> bool:
+    """Cheap check (runs inside the hook): untranslated Arabic typed in THIS window, or a translation being written."""
+    if not (_guard_enabled and _enabled):
+        return False
+    if _busy:
+        return True
+    text = _buffer
+    if not text or not ARABIC_CHAR_PATTERN.search(text):
+        return False
+    try:
+        return int(_user32.GetForegroundWindow() or 0) == int(_buffer_hwnd or 0)
+    except Exception:
+        return False
+
+
+def _guard_app_in_front() -> bool:
+    return _get_foreground_process_name() in _guard_apps
+
+
+def _guard_touch_signal():
+    """Tell the counter program (a separate process) 'that send was blocked - do not count it'."""
+    try:
+        if os.path.exists(GUARD_SIGNAL_PATH):
+            os.utime(GUARD_SIGNAL_PATH, None)
+        else:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(GUARD_SIGNAL_PATH, "w", encoding="utf-8") as f:
+                f.write("blocked")
+    except Exception:
+        pass
+
+
+def _guard_block(kind: str):
+    """A send was just blocked (called inside the hook - keep it short)."""
+    global _guard_last_block, _buffer
+    _guard_touch_signal()
+    snapshot = ""
+    if not _busy:
+        with _buffer_lock:
+            snapshot = _buffer
+            _buffer = ""
+    _guard_last_block = time.monotonic()
+    threading.Thread(target=_guard_after_block, args=(kind, snapshot), daemon=True).start()
+
+
+def _guard_after_block(kind: str, snapshot: str):
+    """Background: beep, tell the user, translate the Arabic in place."""
+    global _guard_last_notice, _buffer
+    try:
+        import winsound
+        winsound.MessageBeep(0x30)        # MB_ICONEXCLAMATION
+    except Exception:
+        pass
+    safe_print(f"[INFO] Game guard: blocked a send ({kind}) - the text was still Arabic.")
+    now = time.monotonic()
+    if now - _guard_last_notice > GUARD_NOTICE_EVERY_SECONDS:
+        _guard_last_notice = now
+        _notify("لسه مترجمتش!", "الرسالة متبعتتش لأنها عربي - بترجمها دلوقتي، وبعدين دوس Enter تاني.")
+    _ui_call(_log_event, "WARN", "Blocked: Arabic message not sent",
+             "The chat box still held untranslated Arabic.", "It is being translated now - press Enter again to send.")
+    if not snapshot or not ARABIC_CHAR_PATTERN.search(snapshot):
+        return                              # a translation is already being written: just blocked
+    time.sleep(0.12)                        # let the Enter / mouse button come back up first
+    try:
+        _handle_trigger(snapshot)
+    except Exception as e:
+        safe_print(f"[ERROR] Game guard: translation failed: {e}")
+    if not _last_replace_ok:
+        # Not translated (no internet, empty answer...): keep protecting that Arabic.
+        with _buffer_lock:
+            if not _buffer:
+                _buffer = snapshot
+        _note_buffer_window()
+
+
+def _guard_kbd_callback(n_code, w_param, l_param):
+    global _guard_swallow_enter_up
+    try:
+        if n_code >= 0:
+            info = ctypes.cast(l_param, ctypes.POINTER(_GuardKbdHook)).contents
+            if info.vkCode == 0x0D and not (info.flags & 0x10):      # VK_RETURN, not injected
+                if w_param in (0x0100, 0x0104):                       # WM_KEYDOWN / WM_SYSKEYDOWN
+                    if _guard_pending_arabic() and _guard_app_in_front():
+                        if not _guard_swallow_enter_up:               # first press (not auto-repeat)
+                            _guard_block("Enter")
+                        _guard_swallow_enter_up = True
+                        return 1
+                elif w_param in (0x0101, 0x0105) and _guard_swallow_enter_up:   # key up
+                    _guard_swallow_enter_up = False
+                    return 1
+    except Exception:
+        pass
+    return _w_user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+
+def _guard_mouse_callback(n_code, w_param, l_param):
+    global _guard_swallow_click_up
+    try:
+        if n_code >= 0:
+            if w_param == 0x0201:                                     # WM_LBUTTONDOWN
+                info = ctypes.cast(l_param, ctypes.POINTER(_GuardMouseHook)).contents
+                if not (info.flags & 0x01) and _guard_pending_arabic() and _guard_app_in_front():
+                    hwnd, rect = _work_foreground_emulator_any()
+                    if rect is not None and _work_click_hits_send_button(rect, info.pt.x, info.pt.y):
+                        _guard_swallow_click_up = True
+                        _guard_block("click on the send arrow")
+                        return 1
+            elif w_param == 0x0202 and _guard_swallow_click_up:      # WM_LBUTTONUP
+                _guard_swallow_click_up = False
+                return 1
+    except Exception:
+        pass
+    return _w_user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+
+def _work_foreground_emulator_any():
+    """(hwnd, rect) of the foreground window, whatever program it is."""
+    hwnd = _w_user32.GetForegroundWindow()
+    if not hwnd:
+        return None, None
+    rect = wintypes.RECT()
+    if not _w_user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None, None
+    return hwnd, rect
+
+
+def _guard_thread():
+    try:
+        module = _w_kernel32.GetModuleHandleW(None)
+        kbd_ref = _WorkHookProc(_guard_kbd_callback)
+        mouse_ref = _WorkHookProc(_guard_mouse_callback)
+        _guard_proc_refs.extend([kbd_ref, mouse_ref])
+        kbd_hook = _w_user32.SetWindowsHookExW(13, kbd_ref, module, 0)      # WH_KEYBOARD_LL
+        mouse_hook = _w_user32.SetWindowsHookExW(14, mouse_ref, module, 0)  # WH_MOUSE_LL
+        if not kbd_hook:
+            raise OSError(f"SetWindowsHookEx failed (error {ctypes.get_last_error()})")
+        safe_print("[INFO] Game guard is ready (blocks untranslated Arabic in: "
+                   f"{', '.join(sorted(_guard_apps)) or 'no program'}).")
+        msg = wintypes.MSG()
+        while _w_user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            pass
+        _w_user32.UnhookWindowsHookEx(kbd_hook)
+        if mouse_hook:
+            _w_user32.UnhookWindowsHookEx(mouse_hook)
+    except Exception as e:
+        safe_print(f"[ERROR] Game guard could not start: {e}")
+        _ui_call(_log_event, "WARN", "Game guard unavailable", str(e),
+                 "Untranslated Arabic will NOT be blocked. Try running the program as Administrator.")
+
+
+def _guard_start():
+    """Start the guard hooks once (they check the on/off setting themselves)."""
+    global _guard_thread_started
+    if not _IS_WINDOWS or _guard_thread_started or not _guard_enabled:
+        return
+    _guard_thread_started = True
+    threading.Thread(target=_guard_thread, daemon=True, name="game-guard").start()
+
+
 def _build_tray_icon():
     menu = pystray.Menu(
         # default=True -> this is what a left-click/double-click on the
@@ -7917,7 +8359,9 @@ def main():
     _pump_ui_queue()  # starts the background -> UI task pump
     _start_single_instance_listener()  # a second launch brings this window to the front
     # ("يلا نشتغل" runs as its own program now: see _counter_main / "--counter".)
+    _guard_start()   # block sending untranslated Arabic in the game (Settings > Game)
     _refresh_usage(force=True)
+    _root.after(1500, _maybe_show_whats_new)   # first start after an update: "What's new"
     _root.after(5000, _schedule_update_checks)  # first update check ~5s after launch
 
     _tray_icon = _build_tray_icon()
