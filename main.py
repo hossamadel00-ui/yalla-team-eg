@@ -129,7 +129,20 @@ except ImportError:
     safe_print("ERROR: 'Pillow' library is not installed. Run: pip install -r requirements.txt")
     sys.exit(1)
 
-import translators as ts  # Arabic -> English translation (no 'cgi' dependency)
+# FIX (1.0.25): 'translators' asks the INTERNET which country you are in the
+# moment it is imported (to pick its global or Chinese servers). With no
+# connection it raised "Unable to connect the Internet" and the WHOLE program
+# (translator and counter) closed before any window appeared. Telling it the
+# region up front skips that check (EN = the global servers, the ones it picks
+# for Egypt anyway), and the import is guarded so a broken library can never
+# stop the program from opening - only the free engines would be unavailable.
+os.environ.setdefault("translators_default_region", "EN")
+try:
+    import translators as ts  # Arabic -> English translation (no 'cgi' dependency)
+    _TS_IMPORT_ERROR = ""
+except Exception as _ts_error:          # no internet / broken install: open anyway
+    ts = None
+    _TS_IMPORT_ERROR = f"{type(_ts_error).__name__}: {_ts_error}"
 
 # 'anthropic' is OPTIONAL: only needed if the user chooses the "claude"
 # engine from Settings. We don't hard-fail the whole program if it's
@@ -209,7 +222,7 @@ COUNTER_APP_USER_MODEL_ID = "YallaTeamEG.WorkCounter"   # must match the install
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.24"
+APP_VERSION = "1.0.25"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -809,6 +822,11 @@ _select_trigger_key = _saved_config.get("select_trigger_key", "f4")
 _select_trigger_components = {p.strip() for p in _select_trigger_key.split("+")}
 _select_hotkey_handle = None
 
+# ---- Copy text from the screen (1.0.25): drag a box, Windows OCR, clipboard.
+_ocr_trigger_key = _saved_config.get("ocr_trigger_key", "alt+4")
+_ocr_trigger_components = {p.strip() for p in _ocr_trigger_key.split("+")}
+_ocr_hotkey_handle = None
+
 # ---- Fallback engine: if the PRIMARY engine (_translate_engine) fails
 # for a given translation, we immediately retry that same sentence,
 # ONCE, with this engine instead. The saved primary engine never
@@ -1102,7 +1120,8 @@ def _register_tone_hotkey(key_combo: str) -> bool:
     parts = {p.strip() for p in key_combo.split("+")}
     if parts.issubset({"ctrl", "alt", "shift", "windows"}):
         return False
-    if parts in (_trigger_components, _popup_trigger_components, _select_trigger_components):
+    if parts in (_trigger_components, _popup_trigger_components, _select_trigger_components,
+                 _ocr_trigger_components):
         return False
     try:
         new_handle = keyboard.add_hotkey(key_combo, _on_tone_trigger_pressed)
@@ -1920,7 +1939,7 @@ def _on_key_event(event):
     # the sentence - "عندي 25" became "عندي 5" and one Arabic letter was left behind.
     if any(_key_is_part_of_held_hotkey(name, combo) for combo in (
             _trigger_components, _popup_trigger_components,
-            _select_trigger_components, _tone_trigger_components)):
+            _select_trigger_components, _tone_trigger_components, _ocr_trigger_components)):
         return
 
     # Other modifier keys alone: ignore, don't touch the buffer
@@ -2145,6 +2164,14 @@ def _run_translation_inner(sentence: str, direction: str = "ar-en",
         # None = no timeout, i.e. it can hang for minutes on a dead
         # or blocked connection). This is the main fix for engines
         # like google/bing/baidu.
+        global ts, _TS_IMPORT_ERROR
+        if ts is None:                     # it failed at startup (no internet?): try again now
+            try:
+                import translators as _ts_retry
+                ts, _TS_IMPORT_ERROR = _ts_retry, ""
+            except Exception as e:
+                raise RuntimeError("The free translation engines could not load (no internet?). "
+                                   f"{type(e).__name__}: {e}") from e
         return ts.translate_text(
             sentence, translator=engine, from_language=from_lang, to_language=to_lang,
             timeout=TRANSLATION_TIMEOUT_SECONDS,
@@ -3237,7 +3264,7 @@ def _register_select_hotkey(key_combo: str) -> bool:
         )
         return False
 
-    if parts == _trigger_components or parts == _popup_trigger_components:
+    if parts == _trigger_components or parts == _popup_trigger_components or parts == _ocr_trigger_components:
         safe_print(f"[ERROR] '{key_combo}' is already used by another hotkey in this "
                    f"program - pick a different key for Select-translate.")
         return False
@@ -3468,6 +3495,17 @@ SETTINGS_HELP.update({
         "السرعات: turbo / normal / safe.\n\n"
         "اسم البرنامج هتلاقيه في Task Manager > Details. أي برنامج مش في "
         "القايمة بيستخدم السرعة العامة اللي في الشاشة الرئيسية (Typing speed)."
+    ),
+    "ocr": (
+        "Copy text from screen - نسخ كلام من الشاشة",
+        "دوس الزرار ده (Alt+4 من الأول)، الشاشة هتغمق شوية، حدد بالماوس الحتة "
+        "اللي فيها الكلام. البرنامج هيقرا الكلام اللي فيها ويحطه في الـ Clipboard، "
+        "وتلصقه بـ Ctrl+V في أي مكان.\n\n"
+        "Esc أو كليك يمين يلغي.\n\n"
+        "البرنامج بيستخدم قارئ النصوص المدمج في ويندوز: من غير نت وببلاش.\n\n"
+        "الإنجليزي شغال على أي ويندوز. العربي محتاج قارئ العربي يكون متسطب: "
+        "Settings > Time & language > Language > العربي > Optional features > "
+        "Optical character recognition (مرة واحدة بس)."
     ),
     "guard_block": (
         "Block Arabic - منع إرسال العربي",
@@ -3722,6 +3760,22 @@ def _open_settings_window():
     tk.Label(
         general_tab, text="(select any text with the mouse in any program, press this key, and\n"
                   "it's replaced in place with its translation - direction auto-detected)",
+        font=("Arial", 8), fg="gray", justify="left"
+    ).pack(anchor="w", padx=15, pady=(2, 6))
+
+    # ---- Copy text from the screen (1.0.25) ----
+    ocr_row = _setting_row(general_tab, "ocr", padding)
+    tk.Label(
+        ocr_row, text="Copy text from screen key - نسخ كلام من الشاشة:",
+        font=("Arial", 11), wraplength=350, justify="left"
+    ).pack(side="left", anchor="w")
+    ocr_hotkey_var = tk.StringVar(value=_ocr_trigger_key)
+    ttk.Combobox(
+        general_tab, textvariable=ocr_hotkey_var, values=["alt+4"] + list(HOTKEY_PRESETS), font=("Arial", 11)
+    ).pack(fill="x", padx=15)
+    tk.Label(
+        general_tab, text="(press it, drag a box around any text on the screen, and the text is copied -\n"
+                  "paste it with Ctrl+V. Uses Windows' own text reader, works offline)",
         font=("Arial", 8), fg="gray", justify="left"
     ).pack(anchor="w", padx=15, pady=(2, 6))
 
@@ -4219,6 +4273,17 @@ def _open_settings_window():
                     "Keeping the previous key."
                 )
                 select_hotkey_var.set(_select_trigger_key)
+
+        new_ocr_hotkey = ocr_hotkey_var.get().strip().lower()
+        if new_ocr_hotkey and new_ocr_hotkey != _ocr_trigger_key:
+            if not _register_ocr_hotkey(new_ocr_hotkey):
+                messagebox.showerror(
+                    "Invalid copy-text key",
+                    f"Could not register '{new_ocr_hotkey}' as the 'Copy text from screen' key "
+                    "(invalid, only modifier keys, or already used by another key of this program).\n\n"
+                    "Keeping the previous key."
+                )
+                ocr_hotkey_var.set(_ocr_trigger_key)
 
         new_tone_hotkey = tone_hotkey_var.get().strip().lower()
         if new_tone_hotkey != _tone_trigger_key:
@@ -4723,7 +4788,8 @@ def _current_info_text() -> str:
     return (
         f"Arabic → {lang_name}: {_trigger_key.upper()}   ·   "
         f"Popup: {_popup_trigger_key.upper()} ({'ON' if _popup_auto_mode else 'OFF'})   ·   "
-        f"Selected text: {_select_trigger_key.upper()}"
+        f"Selected text: {_select_trigger_key.upper()}   ·   "
+        f"Copy from screen: {_ocr_trigger_key.upper()}"
     )
 
 
@@ -7477,12 +7543,345 @@ def _tray_open_work(icon, item):
 
 
 
+
+# =========================================================================
+# COPY TEXT FROM THE SCREEN (1.0.25) - default hotkey ALT+4
+# -------------------------------------------------------------------------
+# Press the key, drag a box around some text anywhere on the screen (Esc or
+# right-click cancels), and the text in that box is read with Windows' own
+# built-in OCR (offline, free) and put on the clipboard - paste it anywhere.
+# Arabic needs Windows' Arabic OCR to be installed (Settings > Time &
+# language > Language > Arabic > Optional features: Optical character
+# recognition); English works on every Windows 10/11.
+# The OCR runs through PowerShell's WinRT bridge, so no extra Python
+# packages are needed in the build.
+# =========================================================================
+OCR_MAX_DIMENSION = 2600          # Windows.Media.Ocr refuses bigger images
+OCR_TIMEOUT_SECONDS = 40
+_ocr_overlay = None
+_ocr_busy = False
+
+_OCR_POWERSHELL = r'''
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Globalization.Language, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Foundation.IAsyncOperation`1, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Storage.Streams.RandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, [Type]$type) {
+    $task = $asTask.MakeGenericMethod($type).Invoke($null, @($op))
+    $task.Wait(-1) | Out-Null
+    $task.Result
+}
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('__PATH__')) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$available = @([Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages)
+$results = @()
+foreach ($tag in @('ar', 'en')) {
+    $lang = $available | Where-Object { $_.LanguageTag -like "$tag*" } | Select-Object -First 1
+    if ($lang -eq $null) { continue }
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang)
+    if ($engine -eq $null) { continue }
+    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    $lines = @($result.Lines | ForEach-Object { $_.Text })
+    $results += ,@{ lang = $lang.LanguageTag; text = ($lines -join "`n") }
+}
+$stream.Dispose()
+@{ langs = @($available | ForEach-Object { $_.LanguageTag }); results = $results } | ConvertTo-Json -Depth 5 -Compress
+'''
+
+
+def _ocr_read_image(path: str) -> dict:
+    """Windows OCR on an image file. {'langs': [...], 'results': [{'lang', 'text'}...]}"""
+    script = _OCR_POWERSHELL.replace("__PATH__", path.replace("'", "''"))
+    code, out, err = _powershell(script, timeout=OCR_TIMEOUT_SECONDS)
+    if code != 0:
+        raise RuntimeError((err or out or f"PowerShell exit code {code}").strip()[:400])
+    start = out.find("{")
+    data = json.loads(out[start:]) if start >= 0 else {}
+    results = data.get("results") or []
+    if isinstance(results, dict):
+        results = [results]
+    langs = data.get("langs") or []
+    if isinstance(langs, str):
+        langs = [langs]
+    return {"langs": langs, "results": results}
+
+
+def _ocr_pick_text(results: list) -> str:
+    """Arabic reader's text if it found Arabic letters, otherwise the English reader's text."""
+    by_lang = {}
+    for item in results:
+        lang = str(item.get("lang", "")).lower()[:2]
+        by_lang[lang] = (item.get("text") or "").strip()
+    arabic = by_lang.get("ar", "")
+    english = by_lang.get("en", "")
+    if arabic and len(ARABIC_CHAR_PATTERN.findall(arabic)) >= 2:
+        return arabic
+    return english or arabic
+
+
+def _on_ocr_trigger_pressed():
+    """Hotkey (keyboard thread): open the box-drawing overlay on the UI thread."""
+    if not _enabled:
+        return
+    _ui_call(_ocr_start_capture)
+
+
+def _ocr_start_capture():
+    """UI thread: a dim full-screen layer; drag a box around the text."""
+    global _ocr_overlay
+    if _ocr_busy:
+        return
+    try:
+        if _ocr_overlay is not None and _ocr_overlay.winfo_exists():
+            return
+    except tk.TclError:
+        pass
+    try:
+        metrics = ctypes.windll.user32.GetSystemMetrics
+        vx, vy, vw, vh = metrics(76), metrics(77), metrics(78), metrics(79)   # the whole virtual screen
+    except Exception:
+        vx, vy, vw, vh = 0, 0, _root.winfo_screenwidth(), _root.winfo_screenheight()
+    win = tk.Toplevel(_root)
+    _ocr_overlay = win
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+    try:
+        win.attributes("-alpha", 0.35)
+    except tk.TclError:
+        pass
+    win.geometry(f"{vw}x{vh}+{vx}+{vy}")
+    canvas = tk.Canvas(win, bg="black", highlightthickness=0, cursor="crosshair")
+    canvas.pack(fill="both", expand=True)
+    canvas.create_text(vw // 2, 40, fill="white", font=("Segoe UI", 16, "bold"),
+                       text="حدد الكلام بالماوس عشان يتنسخ   ·   Esc = إلغاء")
+    state = {"x0": 0, "y0": 0, "rect": None}
+
+    def close():
+        global _ocr_overlay
+        try:
+            win.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+        _ocr_overlay = None
+
+    def on_press(event):
+        state["x0"], state["y0"] = event.x_root, event.y_root
+        if state["rect"] is not None:
+            canvas.delete(state["rect"])
+        state["rect"] = canvas.create_rectangle(event.x, event.y, event.x, event.y,
+                                                outline="#33ff66", width=3, fill="white")
+
+    def on_drag(event):
+        if state["rect"] is not None:
+            canvas.coords(state["rect"], state["x0"] - vx, state["y0"] - vy, event.x_root - vx, event.y_root - vy)
+
+    def on_release(event):
+        x0, y0 = min(state["x0"], event.x_root), min(state["y0"], event.y_root)
+        x1, y1 = max(state["x0"], event.x_root), max(state["y0"], event.y_root)
+        close()
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            return                                     # a click, not a box
+        # Let the screen repaint without the dim layer, then read it.
+        _root.after(150, lambda: threading.Thread(target=_ocr_capture_and_copy,
+                                                  args=(x0, y0, x1 - x0, y1 - y0), daemon=True).start())
+
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
+    canvas.bind("<ButtonRelease-1>", on_release)
+    canvas.bind("<ButtonPress-3>", lambda e: close())
+    win.bind("<Escape>", lambda e: close())
+    win.after(30000, close)                            # never leave the screen dimmed
+    win.lift()
+    win.focus_force()
+    try:
+        win.grab_set()
+    except tk.TclError:
+        pass
+
+
+def _ocr_capture_and_copy(x: int, y: int, w: int, h: int):
+    """Background: grab the box, OCR it, put the text on the clipboard."""
+    global _ocr_busy
+    import tempfile
+    _ocr_busy = True
+    path = os.path.join(tempfile.gettempdir(), "yallateam_ocr.png")
+    try:
+        data = _work_grab(x, y, w, h)
+        if not data:
+            _notify("نسخ الكلام", "مقدرتش أصوّر الحتة دي من الشاشة.")
+            return
+        picture = Image.frombuffer("RGBA", (w, h), data, "raw", "BGRA", 0, 1).convert("RGB")
+        # Small game text reads much better when enlarged first.
+        factor = 1.0
+        if h < 500:
+            factor = min(3.0, max(1.0, 500.0 / max(1, h)))
+        factor = min(factor, OCR_MAX_DIMENSION / max(1, w), OCR_MAX_DIMENSION / max(1, h))
+        if factor > 1.05:
+            picture = picture.resize((int(w * factor), int(h * factor)), Image.LANCZOS)
+        picture.save(path)
+        safe_print(f"[INFO] Reading text from the screen ({w}x{h}, x{factor:.1f})...")
+        result = _ocr_read_image(path)
+        text = _ocr_pick_text(result["results"])
+        has_arabic_reader = any(str(l).lower().startswith("ar") for l in result["langs"])
+        if not result["langs"]:
+            _notify("نسخ الكلام", "قارئ النصوص بتاع ويندوز مش متاح على الجهاز ده.")
+            return
+        if not text:
+            hint = "" if has_arabic_reader else (
+                " لو الكلام عربي: لازم تسطّب قارئ العربي من Settings > Time & language > "
+                "Language > العربي > Optional features > Optical character recognition.")
+            _notify("نسخ الكلام", "ملقتش كلام في الحتة دي." + hint)
+            return
+        if not _set_clipboard_text(text):
+            _notify("نسخ الكلام", "قريت الكلام بس مقدرتش أحطه في الـ Clipboard - جرّب تاني.")
+            return
+        preview = " ".join(text.split())
+        preview = preview[:60] + ("…" if len(preview) > 60 else "")
+        _play_soft_sound()
+        _notify("اتنسخ ✓ (Ctrl+V للصق)", preview)
+        _ui_call(_log_event, "OK", "Text copied from the screen", preview)
+    except Exception as e:
+        safe_print(f"[ERROR] Copy text from screen failed: {e}")
+        _notify("نسخ الكلام", "حصلت مشكلة في قراءة الكلام من الشاشة.")
+        _ui_call(_log_event, "ERROR", "Copy text from screen failed", f"{type(e).__name__}: {e}")
+    finally:
+        _ocr_busy = False
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def _register_ocr_hotkey(key_combo: str) -> bool:
+    """Register the 'copy text from the screen' hotkey (like _register_select_hotkey)."""
+    global _ocr_hotkey_handle, _ocr_trigger_key, _ocr_trigger_components
+    key_combo = key_combo.strip().lower()
+    if not key_combo:
+        return False
+    parts = {p.strip() for p in key_combo.split("+")}
+    if parts.issubset({"ctrl", "alt", "shift", "windows"}):
+        return False
+    if parts in (_trigger_components, _popup_trigger_components, _select_trigger_components,
+                 _tone_trigger_components):
+        return False
+    try:
+        new_handle = keyboard.add_hotkey(key_combo, _on_ocr_trigger_pressed)
+    except Exception as e:
+        safe_print(f"[ERROR] Could not register the copy-text hotkey '{key_combo}': {e}")
+        return False
+    if _ocr_hotkey_handle is not None:
+        try:
+            keyboard.remove_hotkey(_ocr_hotkey_handle)
+        except Exception:
+            pass
+    _ocr_hotkey_handle = new_handle
+    _ocr_trigger_key = key_combo
+    _ocr_trigger_components = parts
+    _save_config(ocr_trigger_key=key_combo)
+    safe_print(f"[INFO] Copy-text-from-screen key set to: {key_combo.upper()}")
+    return True
+
+
+# =========================================================================
+# COUNTER DESKTOP SHORTCUT (1.0.25)
+# -------------------------------------------------------------------------
+# The Setup only made the "يلا نشتغل" desktop icon when "Create a desktop
+# shortcut" was ticked, and a silent update re-uses the choices of the very
+# first install - so many people got no counter icon at all. The Setup now
+# always makes it, and the translator also makes it ONCE if it is missing
+# (if someone deletes it afterwards, it is not brought back).
+# =========================================================================
+def _powershell(script: str, timeout: float = 30.0) -> tuple:
+    """Run a PowerShell script hidden (passed UTF-16 encoded, so Arabic paths are safe).
+    Returns (exit_code, stdout_text, stderr_text)."""
+    import base64
+    import subprocess
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-EncodedCommand", encoded],
+        capture_output=True, timeout=timeout, creationflags=0x08000000,   # CREATE_NO_WINDOW
+    )
+    def _text(raw):
+        for enc in ("utf-8", "mbcs"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", "replace")
+    return result.returncode, _text(result.stdout or b""), _text(result.stderr or b"")
+
+
+def _desktop_folder() -> str:
+    """The user's real Desktop folder (also when it was moved, e.g. to OneDrive)."""
+    try:
+        buffer = ctypes.create_unicode_buffer(520)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, buffer) == 0 and buffer.value:
+            return buffer.value                       # CSIDL_DESKTOPDIRECTORY
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+def _ensure_counter_shortcut():
+    """Background, once: create the "يلا نشتغل" desktop shortcut if it does not exist."""
+    if not (_IS_WINDOWS and getattr(sys, "frozen", False)):
+        return
+    try:
+        if _load_config().get("counter_shortcut_done"):
+            return
+        exe = sys.executable
+        icon = os.path.join(os.path.dirname(exe), "counter_icon.ico")
+        link = os.path.join(_desktop_folder(), COUNTER_APP_NAME + ".lnk")
+        if not os.path.exists(link):
+            def q(text):
+                return "'" + text.replace("'", "''") + "'"
+            script = (
+                "$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + q(link) + "); "
+                "$s.TargetPath = " + q(exe) + "; "
+                "$s.Arguments = '--counter'; "
+                "$s.WorkingDirectory = " + q(os.path.dirname(exe)) + "; "
+                + ("$s.IconLocation = " + q(icon + ",0") + "; " if os.path.exists(icon) else "")
+                + "$s.Description = " + q(COUNTER_APP_NAME) + "; "
+                "$s.Save()"
+            )
+            code, _out, err = _powershell(script)
+            if code != 0 or not os.path.exists(link):
+                safe_print(f"[WARNING] Could not create the counter shortcut: {err.strip()[:300]}")
+                return                                # try again next start
+            safe_print(f"[INFO] Created the desktop shortcut: {link}")
+        _save_config(counter_shortcut_done=True)
+    except Exception as e:
+        safe_print(f"[WARNING] Counter shortcut check failed: {e}")
+
+
 # =========================================================================
 # "WHAT'S NEW" (1.0.22): shown ONCE, the first time the program opens after
 # an update. Re-opened any time from Settings > Advanced > "What's new".
 # Keep the newest version first. Plain Egyptian Arabic for the players.
 # =========================================================================
 WHATS_NEW = [
+    ("1.0.25", [
+        "📋 جديد: نسخ كلام من الشاشة - دوس Alt+4 وحدد بالماوس أي حتة فيها كلام، والكلام هيتنسخ "
+        "وتلصقه بـ Ctrl+V. (العربي محتاج قارئ العربي في ويندوز - الشرح في زرار ؟ في الإعدادات)",
+        "🌐 البرنامج والعداد بقوا بيفتحوا عادي حتى لو النت فاصل (الترجمة بس اللي بتستنى النت).",
+        "⏱️ أيقونة \"يلا نشتغل\" بقت بتتعمل على الديسكتوب لوحدها لو مش موجودة.",
+    ]),
     ("1.0.24", [
         "⏱️ العداد بقى بيعد الرسالة لما تبعتها بزرار OK اللي في شريط الكتابة (مش بس Enter والسهم الأخضر).",
         "⏱️ العداد بقى بيبص على الشاشة لحظة الإرسال بالظبط، فمبقاش بيفوّت أول رسالة بعد الترجمة.",
@@ -7774,6 +8173,8 @@ def _build_tray_icon():
         pystray.MenuItem("Dark mode", _tray_toggle_theme, checked=_tray_is_dark),
         pystray.MenuItem("Auto EN -> AR popup (on copy)", _tray_toggle_popup_auto_mode, checked=_tray_is_popup_auto_mode),
         pystray.MenuItem("Start with Windows", _tray_toggle_startup, checked=_tray_is_startup_enabled),
+        pystray.MenuItem("Copy text from screen - نسخ كلام من الشاشة",
+                         lambda icon, item: _on_ocr_trigger_pressed()),
         pystray.MenuItem("Settings...", _tray_open_settings),
         pystray.MenuItem("Check for updates", lambda icon, item: _check_for_update_manual()),
         pystray.MenuItem("Exit", _tray_exit),
@@ -8477,6 +8878,7 @@ def main():
     _guard_start()   # block sending untranslated Arabic in the game (Settings > Game)
     _refresh_usage(force=True)
     _root.after(1500, _maybe_show_whats_new)   # first start after an update: "What's new"
+    threading.Thread(target=_ensure_counter_shortcut, daemon=True).start()   # once: "يلا نشتغل" icon
     _root.after(5000, _schedule_update_checks)  # first update check ~5s after launch
 
     _tray_icon = _build_tray_icon()
@@ -8498,6 +8900,17 @@ def main():
             cause=f"'{_popup_trigger_key.upper()}' could not be registered - another "
                   f"program is probably already using it.",
             quick_fix="Open Settings and choose a different auto-popup key.",
+            action=ACTION_SETTINGS,
+            counts_as_failure=False,
+        )
+
+    if not _register_ocr_hotkey(_ocr_trigger_key):
+        safe_print(f"[WARNING] Could not register the copy-text-from-screen key {_ocr_trigger_key.upper()}.")
+        _report_problem(
+            "Copy-text key unavailable",
+            cause=f"'{_ocr_trigger_key.upper()}' could not be registered - another "
+                  f"program is probably already using it.",
+            quick_fix="Open Settings and choose a different 'Copy text from screen' key.",
             action=ACTION_SETTINGS,
             counts_as_failure=False,
         )
