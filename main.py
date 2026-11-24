@@ -222,7 +222,7 @@ COUNTER_APP_USER_MODEL_ID = "YallaTeamEG.WorkCounter"   # must match the install
 #   {"version": "1.0.1", "url": "https://github.com/.../YallaTeam_Setup.exe",
 #    "notes": "optional: what is new"}
 # ---------------------------------------------------------------------
-APP_VERSION = "1.0.26"
+APP_VERSION = "1.0.27"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 10
 UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -634,109 +634,6 @@ if _IS_WINDOWS:
         wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
 
 
-# =========================================================================
-# Synthetic typing via SendInput (1.0.26)
-# -------------------------------------------------------------------------
-# Before 1.0.26 the translation was typed with keyboard.write() /
-# keyboard.send(). That library "presses" the physical key (scan code) for
-# each letter, so Windows turns it into a character using the keyboard
-# layout that is active at that moment. Two real bugs came from that:
-#   - with the Arabic layout still active, typing "how" produced Arabic
-#     letters instead of English;
-#   - a letter whose scan code is shared with a media key (c = Volume Down,
-#     b = Volume Up, d = Mute - same code, only the "extended" flag differs)
-#     could be sent as the media key, so the volume dropped while typing.
-# Now letters are sent as Unicode characters (KEYEVENTF_UNICODE): Windows
-# delivers the exact character, whatever the layout, and no scan code is
-# involved. Shortcuts (Ctrl+A/C/V, Backspace, Enter) are sent with fixed
-# virtual-key codes and never with the extended flag.
-# =========================================================================
-_SI_VK_BACK = 0x08
-_SI_VK_RETURN = 0x0D
-_SI_VK_CONTROL = 0x11
-_SI_KEYEVENTF_KEYUP = 0x0002
-_SI_KEYEVENTF_UNICODE = 0x0004
-
-if _IS_WINDOWS:
-    class _SI_KEYBDINPUT(ctypes.Structure):
-        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
-                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
-
-    class _SI_MOUSEINPUT(ctypes.Structure):      # only here so the union has the real size
-        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
-                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
-
-    class _SI_INPUTUNION(ctypes.Union):
-        _fields_ = [("ki", _SI_KEYBDINPUT), ("mi", _SI_MOUSEINPUT)]
-
-    class _SI_INPUT(ctypes.Structure):
-        _fields_ = [("type", wintypes.DWORD), ("u", _SI_INPUTUNION)]
-
-    _user32.SendInput.restype = wintypes.UINT
-    _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_SI_INPUT), ctypes.c_int]
-    _user32.MapVirtualKeyW.restype = wintypes.UINT
-    _user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
-
-
-def _si_send(events) -> bool:
-    """events: list of (vk, scan, flags). Sends them in one SendInput call."""
-    n = len(events)
-    if not n:
-        return True
-    arr = (_SI_INPUT * n)()
-    for i, (vk, scan, flags) in enumerate(events):
-        arr[i].type = 1                               # INPUT_KEYBOARD
-        arr[i].u.ki = _SI_KEYBDINPUT(vk, scan, flags, 0, 0)
-    sent = _user32.SendInput(n, arr, ctypes.sizeof(_SI_INPUT))
-    return sent == n
-
-
-def _si_vk_events(vk: int, up: bool):
-    scan = _user32.MapVirtualKeyW(vk, 0) & 0xFF      # MAPVK_VK_TO_VSC, never extended
-    return (vk, scan, _SI_KEYEVENTF_KEYUP if up else 0)
-
-
-def _si_tap(vk: int, ctrl: bool = False):
-    """Press and release one key (optionally with Ctrl), e.g. Ctrl+A or Backspace."""
-    if not _IS_WINDOWS:
-        keyboard.send(("ctrl+" if ctrl else "") + {_SI_VK_BACK: "backspace", _SI_VK_RETURN: "enter"}.get(vk, chr(vk).lower()))
-        return
-    events = []
-    if ctrl:
-        events.append(_si_vk_events(_SI_VK_CONTROL, False))
-    events.append(_si_vk_events(vk, False))
-    events.append(_si_vk_events(vk, True))
-    if ctrl:
-        events.append(_si_vk_events(_SI_VK_CONTROL, True))
-    if not _si_send(events):
-        raise OSError(f"SendInput failed (error {ctypes.get_last_error()})")
-
-
-def _si_ctrl(letter: str):
-    """Ctrl+<letter> with a fixed virtual-key code (works with any layout)."""
-    _si_tap(ord(letter.upper()), ctrl=True)
-
-
-def _si_type_text(text: str, delay: float = 0.0):
-    """Type 'text' as Unicode characters - independent of the keyboard layout."""
-    if not _IS_WINDOWS:
-        keyboard.write(text, delay=delay)
-        return
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    for ch in text:
-        if ch == "\n":
-            _si_tap(_SI_VK_RETURN)
-        else:
-            raw = ch.encode("utf-16-le")
-            units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
-            events = [(0, u, _SI_KEYEVENTF_UNICODE) for u in units]
-            events += [(0, u, _SI_KEYEVENTF_UNICODE | _SI_KEYEVENTF_KEYUP) for u in units]
-            if not _si_send(events):
-                raise OSError(f"SendInput failed (error {ctypes.get_last_error()})")
-        if delay:
-            time.sleep(delay)
-
-
 def _get_clipboard_text():
     """
     Return the current clipboard text, or None if it's empty, isn't
@@ -1129,7 +1026,7 @@ def _paste_text_via_clipboard(text: str) -> bool:
             _set_clipboard_text(previous)
         return False
     time.sleep(0.05)
-    _si_ctrl("v")
+    keyboard.send("ctrl+v")
     time.sleep(0.25)  # let the target app read the clipboard before we restore it
     if previous is not None:
         _set_clipboard_text(previous)
@@ -2215,7 +2112,7 @@ def _try_get_selection():
     """
     previous = _get_clipboard_text()
     try:
-        _si_ctrl("c")
+        keyboard.send("ctrl+c")
         time.sleep(0.15)  # give the foreground app time to write the clipboard
         current = _get_clipboard_text()
     except Exception:
@@ -2434,7 +2331,7 @@ def _translate_selection(sentence: str, previous_clipboard):
 
     _set_clipboard_text(translated_text)
     time.sleep(0.05)
-    _si_ctrl("v")
+    keyboard.send("ctrl+v")
     time.sleep(0.05)
     _restore_clipboard(previous_clipboard)
 
@@ -2478,7 +2375,7 @@ def _translate_selection_auto_direction(sentence: str, previous_clipboard):
 
     _set_clipboard_text(translated_text)
     time.sleep(0.05)
-    _si_ctrl("v")
+    keyboard.send("ctrl+v")
     time.sleep(0.05)
     _restore_clipboard(previous_clipboard)
 
@@ -2577,14 +2474,14 @@ def _translate_typed_buffer(arabic_sentence: str, app_name: str = ""):
 
     if _guard_clear_field and (app_name or "").lower() in _guard_apps:
         # Option: select the whole input box and delete it (never leaves a letter behind).
-        _si_ctrl("a")
+        keyboard.send("ctrl+a")
         time.sleep(max(key_delay, 0.06))
-        _si_tap(_SI_VK_BACK)
+        keyboard.send("backspace")
         time.sleep(max(key_delay, 0.06))
     else:
         delete_count = len(arabic_sentence)
         for _ in range(delete_count):
-            _si_tap(_SI_VK_BACK)
+            keyboard.send("backspace")
             time.sleep(key_delay)
 
     # Long translations are pasted in one go (faster and safer than typing
@@ -2594,7 +2491,7 @@ def _translate_typed_buffer(arabic_sentence: str, app_name: str = ""):
     if speed_profile != "safe" and _paste_threshold > 0 and len(translated_text) > _paste_threshold:
         pasted = _paste_text_via_clipboard(translated_text)
     if not pasted:
-        _si_type_text(translated_text, delay=key_delay)
+        keyboard.write(translated_text, delay=key_delay)
 
     safe_print(f"[OK] Replaced with: {translated_text}")
     _last_replace_ok = True
@@ -7979,9 +7876,8 @@ def _ensure_counter_shortcut():
 # Keep the newest version first. Plain Egyptian Arabic for the players.
 # =========================================================================
 WHATS_NEW = [
-    ("1.0.26", [
-        "⌨️ اتصلّح: وقت كتابة الترجمة كان ساعات بيطلع حروف عربي بدل الإنجليزي، "
-        "وكان الصوت بيوطى لوحده. البرنامج بقى بيكتب الحروف نفسها مهما كانت لغة الكيبورد.",
+    ("1.0.27", [
+        "↩️ رجّعنا طريقة كتابة الترجمة القديمة، عشان الإصدار اللي فات كان بيخلّي Alt+1 يقف بعد شوية.",
     ]),
     ("1.0.25", [
         "📋 جديد: نسخ كلام من الشاشة - دوس Alt+4 وحدد بالماوس أي حتة فيها كلام، والكلام هيتنسخ "
