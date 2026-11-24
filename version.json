@@ -1,5 +1,5 @@
 {
-  "version": "1.0.26",
-  "url": "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/setup/YallaTeam_Setup_v1.0.26.exe",
-  "notes": "اتصلّح ظهور حروف عربي ووطي الصوت وقت كتابة الترجمة"
+  "version": "1.0.27",
+  "url": "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/setup/YallaTeam_Setup_v1.0.27.exe",
+  "notes": "رجّعنا طريقة كتابة الترجمة القديمة عشان Alt+1 كان بيقف"
 }
