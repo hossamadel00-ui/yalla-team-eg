@@ -1,5 +1,5 @@
 {
-  "version": "1.0.25",
-  "url": "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/setup/YallaTeam_Setup_v1.0.25.exe",
-  "notes": "نسخ كلام من الشاشة بـ Alt+4 + البرنامج بيفتح من غير نت + أيقونة يلا نشتغل على الديسكتوب"
+  "version": "1.0.26",
+  "url": "https://raw.githubusercontent.com/hossamadel00-ui/yalla-team-eg/main/setup/YallaTeam_Setup_v1.0.26.exe",
+  "notes": "اتصلّح ظهور حروف عربي ووطي الصوت وقت كتابة الترجمة"
 }
